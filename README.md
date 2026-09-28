@@ -34,7 +34,13 @@ Open-Meteo (ERA5 / forecast / Previous Runs)     NESO ND (historic CSV)
 | **day** | midnight London, freeze | day (Previous Runs) | 24 h |
 | **week** | Monday 00:00 London, freeze | week (Previous Runs, Optuna) | 168 h |
 
-The live contract: **write the forecast first**, join INDO only after that period has ended. Holdout MAE is not the score that matters; the board is.
+The live contract: **write the forecast first**, join INDO only after that period has ended. Holdout MAE is not the score that matters; the board is. Yesterday is **INDO only** (what happened). Today is the **issued fan** (P10 / P50 / P90). Elapsed hours of today get a black INDO overlay as Insights publishes. The day pack is not seeded with yesterday’s predictions; it runs forward from the midnight freeze.
+
+Live demo: [energy-forecast-production.up.railway.app](https://energy-forecast-production.up.railway.app)
+
+![Next 24 hours live board: yesterday INDO, then today’s P10/P50/P90. Issued 28 Sept 00:00 London. n=27, MAE 874 MW, WRMSSE 0.41, 85% coverage.](docs/live-day-board.png)
+
+*Day freeze, 28 Sept 2026 ~13:00 London. n = 27 scored half-hours so far; MAE 874 MW; WRMSSE 0.41; 80% interval coverage 85%; bias +445 MW. Grey/black before midnight is yesterday’s outturn, not a hindcast.*
 
 Regional / GSP series are out of scope: there is no public live actual.
 
@@ -162,6 +168,7 @@ docker compose up --build
 src/energy_forecast/    library + FastAPI app
 tests/                  pytest (no live APIs)
 notebooks/              EDA → train → eval → Optuna → SHAP → cases
+docs/                   README figures (live board screenshot)
 data/models/            committed artefacts
 data/raw/               NESO ND CSVs
 data/live/              runtime board (gitignored)
