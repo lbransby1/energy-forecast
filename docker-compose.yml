@@ -1,0 +1,13 @@
+services:
+  forecast:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      LIVE_TOKEN: ""
+      WEEK_REISSUE_PASSWORD: "change-me"
+      EF_SKIP_CAPTURE: "0"
+    volumes:
+      - ./data/live:/app/data/live
+      - ./data/processed:/app/data/processed
+    restart: unless-stopped

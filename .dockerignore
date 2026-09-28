@@ -1,0 +1,10 @@
+.venv
+venv
+.ipynb_checkpoints
+**/__pycache__
+**/*.pyc
+notebooks
+.git
+data/processed/*.parquet
+data/processed/*.csv
+data/live/*.parquet

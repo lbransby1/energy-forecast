@@ -1,0 +1,929 @@
+"""Capture live forecasts and score them against Insights INDO as it arrives."""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import os
+import time
+from datetime import date
+from io import StringIO
+
+import numpy as np
+import pandas as pd
+
+from energy_forecast.data.elexon import fetch_indo
+from energy_forecast.evaluate import _naive_scale_mse, _period_band, _wrmsse
+from energy_forecast.features import HOUR_FEATURE_COLUMNS
+from energy_forecast.forecast import (
+    LIVE_INDO_MAX_AGE_MINUTES,
+    attach_indo_actuals,
+    run_forecast,
+    run_pack,
+    validation_metrics,
+)
+from energy_forecast.modes import MEDIUM, SHORT
+from energy_forecast.paths import DATA_LIVE, ensure_data_dirs
+from energy_forecast.settlement import LONDON_TZ
+
+ARCHIVE_NAME = "archive.parquet"
+BOARD_NAME = "board.parquet"
+NEXT30 = "next30"
+DAY = "day"
+WEEK = "week"
+PRESETS = (NEXT30, DAY, WEEK)
+WEEK_PASSWORD_FILE = "week_reissue_password"
+_BOARD_CACHE: dict = {"at": 0.0, "payload": None}
+_BOARD_CACHE_S = 2.0
+
+
+class WeekReissueLocked(PermissionError):
+    """Raised when someone tries to overwrite this week's freeze without the password."""
+
+KEEP = (
+    "preset",
+    "window_start",
+    "issued_at",
+    "mode",
+    "timestamp",
+    "settlement_date",
+    "settlement_period",
+    "lead_hours",
+    "horizon",
+    "lead_band",
+    "p10",
+    "p50",
+    "p90",
+    "interval_width",
+    "actual_mw",
+    "temperature_2m",
+    "demand_lag_1",
+    "demand_lag_2",
+    "demand_lag_48",
+    "demand_lag_336",
+    "last_indo_timestamp",
+    "last_indo_mw",
+)
+
+
+def archive_path():
+    ensure_data_dirs()
+    return DATA_LIVE / ARCHIVE_NAME
+
+
+def board_path():
+    ensure_data_dirs()
+    return DATA_LIVE / BOARD_NAME
+
+
+def frozen_dir():
+    ensure_data_dirs()
+    path = DATA_LIVE / "frozen"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _read_parquet(path, columns=None) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=list(columns or KEEP))
+    out = pd.read_parquet(path)
+    for column in ("issued_at", "timestamp", "window_start", "last_indo_timestamp"):
+        if column in out.columns:
+            out[column] = pd.to_datetime(out[column], utc=True)
+    if "settlement_date" in out.columns:
+        out["settlement_date"] = pd.to_datetime(out["settlement_date"]).dt.tz_localize(None).dt.normalize()
+    return out
+
+
+def load_archive() -> pd.DataFrame:
+    return _read_parquet(archive_path())
+
+
+def save_archive(frame: pd.DataFrame) -> None:
+    keep = [column for column in KEEP if column in frame.columns]
+    sort = [column for column in ("issued_at", "mode", "timestamp") if column in frame.columns]
+    out = frame.loc[:, keep]
+    if sort:
+        out = out.sort_values(sort)
+    out.reset_index(drop=True).to_parquet(archive_path(), index=False)
+
+
+def load_board() -> pd.DataFrame:
+    return _read_parquet(board_path())
+
+
+def save_board(frame: pd.DataFrame) -> None:
+    keep = [column for column in KEEP if column in frame.columns]
+    out = frame.loc[:, keep].sort_values(["preset", "window_start", "timestamp"]).reset_index(drop=True)
+    out.to_parquet(board_path(), index=False)
+
+
+def london_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=LONDON_TZ)
+
+
+def day_window(when: pd.Timestamp | None = None) -> pd.Timestamp:
+    stamp = (when or london_now()).tz_convert(LONDON_TZ)
+    return stamp.normalize().tz_convert("UTC")
+
+
+def week_window(when: pd.Timestamp | None = None) -> pd.Timestamp:
+    stamp = (when or london_now()).tz_convert(LONDON_TZ)
+    monday = stamp.normalize() - pd.Timedelta(days=int(stamp.dayofweek))
+    return monday.tz_convert("UTC")
+
+
+def _as_utc(stamp: pd.Timestamp) -> pd.Timestamp:
+    out = pd.Timestamp(stamp)
+    return out.tz_convert("UTC") if out.tzinfo else out.tz_localize("UTC")
+
+
+def _frozen_path(preset: str, window_start: pd.Timestamp):
+    key = _as_utc(window_start).strftime("%Y%m%dT%H%M")
+    return frozen_dir() / f"{preset}_{key}.parquet"
+
+
+def save_frozen(preset: str, window_start: pd.Timestamp, frame: pd.DataFrame) -> None:
+    if frame is None or frame.empty:
+        return
+    out = frame.copy()
+    out["preset"] = preset
+    out["window_start"] = _as_utc(window_start)
+    out.to_parquet(_frozen_path(preset, window_start), index=False)
+    if preset == NEXT30:
+        _prune_next30_frozen()
+
+
+def _prune_next30_frozen(*, keep_hours: int = 48) -> None:
+    """Keep a rolling window of 30-minute input snapshots."""
+    cutoff = london_now().tz_convert("UTC") - pd.Timedelta(hours=keep_hours)
+    for path in frozen_dir().glob("next30_*.parquet"):
+        try:
+            stamp = pd.to_datetime(path.stem.replace("next30_", ""), format="%Y%m%dT%H%M", utc=True)
+        except ValueError:
+            continue
+        if stamp < cutoff:
+            path.unlink(missing_ok=True)
+
+
+def load_frozen(preset: str, window_start: pd.Timestamp) -> pd.DataFrame:
+    path = _frozen_path(preset, window_start)
+    return _read_parquet(path, columns=None) if path.exists() else pd.DataFrame()
+
+
+def capture(*, mode: str = "both") -> dict:
+    """Legacy hourly short+medium capture (kept for the old archive)."""
+    issued_at = london_now().floor("1h").tz_convert("UTC")
+    raw = run_forecast(mode="both" if mode == "both" else mode, freq="30min")
+    frames = raw.values() if isinstance(raw, dict) else [raw]
+    pieces: list[pd.DataFrame] = []
+    counts: dict[str, int] = {}
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        piece = frame.copy()
+        piece["issued_at"] = issued_at
+        if "mode" not in piece.columns:
+            piece["mode"] = SHORT
+        counts[str(piece["mode"].iloc[0])] = int(len(piece))
+        pieces.append(piece)
+    if not pieces:
+        raise RuntimeError("run_forecast returned no rows")
+    new = pd.concat(pieces, ignore_index=True)
+    archive = load_archive()
+    if not archive.empty:
+        archive = archive.loc[
+            ~((archive["issued_at"] == issued_at) & (archive["mode"].isin(new["mode"].unique())))
+        ]
+    save_archive(pd.concat([archive, new], ignore_index=True))
+    return {
+        "issued_at": issued_at.isoformat(),
+        "rows": {name: counts.get(name, 0) for name in (SHORT, MEDIUM)},
+        "archive_rows": int(len(load_archive())),
+    }
+
+
+def week_reissue_secret() -> str:
+    """Password that overwrites an existing week freeze.
+
+    ``WEEK_REISSUE_PASSWORD`` or ``LIVE_TOKEN`` wins; otherwise the gitignored
+    file under ``data/live/``.
+    """
+    env = (os.environ.get("WEEK_REISSUE_PASSWORD") or os.environ.get("LIVE_TOKEN") or "").strip()
+    if env:
+        return env
+    ensure_data_dirs()
+    path = DATA_LIVE / WEEK_PASSWORD_FILE
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def week_password_ok(given: str | None) -> bool:
+    expected = week_reissue_secret()
+    if not expected or not given:
+        return False
+    left = given.encode("utf-8")
+    right = expected.encode("utf-8")
+    if len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def _run_pack_retry(role: str, hours: float, *, retry: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Hour pack: retry once after 20s if Insights INDO is still catching up."""
+    try:
+        return run_pack(role=role, horizon_hours=hours)
+    except RuntimeError:
+        if not retry:
+            raise
+        time.sleep(20)
+        return run_pack(role=role, horizon_hours=hours)
+
+
+def capture_preset(preset: str, *, force: bool = False, week_password: str | None = None) -> dict:
+    """Issue one board preset. Day/week skip if that window already exists."""
+    if preset not in PRESETS:
+        raise ValueError(f"preset must be one of {PRESETS}")
+    now = london_now()
+    issued_at = now.floor("30min").tz_convert("UTC")
+    if preset == NEXT30:
+        window_start = issued_at
+        role, hours = "hour", 1.0
+    elif preset == DAY:
+        window_start = day_window(now)
+        role, hours = "day", 24.0
+    else:
+        window_start = week_window(now)
+        role, hours = "week", 168.0
+
+    board = load_board()
+    have_window = (
+        not board.empty
+        and ((board["preset"] == preset) & (board["window_start"] == window_start)).any()
+    )
+    missing_frozen = not _frozen_path(preset, window_start).exists()
+    if not force and preset != NEXT30 and have_window and not missing_frozen:
+        return {"preset": preset, "skipped": True, "window_start": window_start.isoformat()}
+    if preset == WEEK and have_window:
+        if not week_password_ok(week_password):
+            raise WeekReissueLocked("week freeze is locked; password required to re-issue")
+
+    try:
+        forecast, frozen = _run_pack_retry(role, hours, retry=(preset == NEXT30))
+    except RuntimeError as exc:
+        if preset != NEXT30:
+            raise
+        return {
+            "preset": preset,
+            "skipped": True,
+            "window_start": window_start.isoformat(),
+            "reason": str(exc),
+        }
+    piece = forecast.copy()
+    piece["preset"] = preset
+    piece["window_start"] = window_start
+    piece["issued_at"] = issued_at
+    if "mode" not in piece.columns:
+        piece["mode"] = preset
+    if not board.empty:
+        if preset == NEXT30:
+            board = board.loc[~((board["preset"] == NEXT30) & (board["issued_at"] == issued_at))]
+        else:
+            board = board.loc[~((board["preset"] == preset) & (board["window_start"] == window_start))]
+    combined = piece if board.empty else pd.concat([board, piece], ignore_index=True)
+    save_board(combined)
+    save_frozen(preset, window_start, frozen)
+    _BOARD_CACHE["payload"] = None
+    return {
+        "preset": preset,
+        "issued_at": issued_at.isoformat(),
+        "window_start": window_start.isoformat(),
+        "rows": int(len(piece)),
+        "board_rows": int(len(load_board())),
+        "inputs": input_health(preset, window_start, issued_at=issued_at),
+    }
+
+
+def import_legacy_next30() -> int:
+    """Copy the old hourly-archive shorts onto the next-30 board (once per timestamp)."""
+    legacy = scored_frame()
+    if legacy.empty or "mode" not in legacy.columns:
+        return 0
+    shorts = legacy.loc[legacy["mode"] == "short"].copy()
+    if shorts.empty:
+        return 0
+    board = load_board()
+    have = set()
+    if not board.empty and "preset" in board.columns:
+        have = set(pd.to_datetime(board.loc[board["preset"] == NEXT30, "timestamp"], utc=True))
+    shorts["timestamp"] = pd.to_datetime(shorts["timestamp"], utc=True)
+    add = shorts.loc[~shorts["timestamp"].isin(have)].copy()
+    if add.empty:
+        return 0
+    add["preset"] = NEXT30
+    add["issued_at"] = pd.to_datetime(add["issued_at"], utc=True)
+    add["window_start"] = add["issued_at"]
+    if "mode" not in add.columns:
+        add["mode"] = NEXT30
+    combined = add if board.empty else pd.concat([board, add], ignore_index=True)
+    save_board(combined)
+    return int(len(add))
+
+
+def tick_presets(*, force: bool = False, week_password: str | None = None) -> dict:
+    """Issue the 30-minute call, and the day/week freeze if that window is empty."""
+    imported = import_legacy_next30()
+    results = {"imported_next30": imported, "next30": capture_preset(NEXT30, force=True)}
+    results["day"] = capture_preset(DAY, force=force)
+    results["week"] = capture_preset(WEEK, force=force, week_password=week_password)
+    results["actuals"] = refresh_actuals()
+    results["wrmsse"] = refresh_wrmsse_cache()
+    return results
+
+
+def refresh_actuals() -> dict:
+    """Join INDO onto elapsed board and legacy archive rows."""
+    updated = {"board": 0, "archive": 0}
+    board = load_board()
+    if not board.empty:
+        before = int(board["actual_mw"].notna().sum()) if "actual_mw" in board.columns else 0
+        joined = attach_indo_actuals(board)
+        save_board(joined)
+        updated["board"] = int(joined["actual_mw"].notna().sum()) - before
+    archive = load_archive()
+    if not archive.empty:
+        before = int(archive["actual_mw"].notna().sum()) if "actual_mw" in archive.columns else 0
+        joined = attach_indo_actuals(archive)
+        if "actual_mw" in archive.columns:
+            joined["actual_mw"] = joined["actual_mw"].combine_first(archive["actual_mw"])
+        save_archive(joined)
+        updated["archive"] = int(joined["actual_mw"].notna().sum()) - before
+    _BOARD_CACHE["payload"] = None
+    return updated
+
+
+def _wrmsse_cache_path():
+    ensure_data_dirs()
+    return DATA_LIVE / "wrmsse_cache.json"
+
+
+def load_wrmsse_cache() -> dict:
+    path = _wrmsse_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def refresh_wrmsse_cache() -> dict:
+    """Recompute WRMSSE from local board + INDO. Called from the capture loop, not GET /board."""
+    cache: dict[str, float | None] = {}
+    try:
+        indo = fetch_indo(
+            (pd.Timestamp.now(tz=LONDON_TZ) - pd.Timedelta(days=56)).strftime("%Y-%m-%d"),
+            date.today().isoformat(),
+        )
+        scale = _naive_scale_mse(indo, "30min", 336)
+    except Exception:  # noqa: BLE001
+        return load_wrmsse_cache()
+    if not np.isfinite(scale) or scale <= 0:
+        return load_wrmsse_cache()
+    board = load_board()
+    for preset in PRESETS:
+        rows = _preset_frame(preset, board)
+        metrics = preset_metrics(rows, compute_wrmsse=False)
+        scored = rows.dropna(subset=["actual_mw", "p50"]) if not rows.empty else rows
+        wrmsse = None
+        if scored is not None and not scored.empty:
+            work = scored.rename(columns={"actual_mw": "demand_mw"}).copy()
+            if "settlement_period" in work.columns:
+                work["period_band"] = work["settlement_period"].map(_period_band)
+            try:
+                value = _wrmsse(work, scale)
+                wrmsse = float(value) if np.isfinite(value) else None
+            except Exception:  # noqa: BLE001
+                wrmsse = None
+        cache[preset] = wrmsse
+        cache[f"{preset}_n"] = metrics["n"]
+    _wrmsse_cache_path().write_text(json.dumps(cache), encoding="utf-8")
+    return cache
+
+
+def _preset_frame(preset: str, board: pd.DataFrame | None = None) -> pd.DataFrame:
+    frame = board if board is not None else load_board()
+    if frame.empty or "preset" not in frame.columns:
+        return frame
+    return frame.loc[frame["preset"] == preset].copy()
+
+
+def _windows(preset: str, board: pd.DataFrame | None = None) -> list[pd.Timestamp]:
+    frame = _preset_frame(preset, board)
+    if frame.empty or "window_start" not in frame.columns:
+        return []
+    return sorted(pd.to_datetime(frame["window_start"].unique()), reverse=True)
+
+
+def _window_rows(preset: str, window_start: pd.Timestamp | None, board: pd.DataFrame | None = None) -> pd.DataFrame:
+    frame = _preset_frame(preset, board)
+    if frame.empty or window_start is None:
+        return frame.iloc[0:0].copy()
+    start = _as_utc(window_start)
+    return frame.loc[frame["window_start"] == start].sort_values("timestamp")
+
+
+def scored_preset(preset: str, window_start: pd.Timestamp | None = None) -> pd.DataFrame:
+    frame = _window_rows(preset, window_start) if window_start is not None else _preset_frame(preset)
+    if frame.empty or "actual_mw" not in frame.columns:
+        return frame
+    return frame.dropna(subset=["actual_mw", "p50"]).copy()
+
+
+def preset_metrics(frame: pd.DataFrame, *, compute_wrmsse: bool = True) -> dict:
+    empty = {
+        "n": 0,
+        "mae": None,
+        "rmse": None,
+        "bias": None,
+        "coverage_80": None,
+        "interval_width": None,
+        "wrmsse": None,
+    }
+    scored = frame.dropna(subset=["actual_mw", "p50"]) if not frame.empty else frame
+    if scored is None or scored.empty:
+        return empty
+    error = scored["actual_mw"] - scored["p50"]
+    covered = (
+        ((scored["actual_mw"] >= scored["p10"]) & (scored["actual_mw"] <= scored["p90"])).mean()
+        if {"p10", "p90"}.issubset(scored.columns)
+        else np.nan
+    )
+    width = (
+        float((scored["p90"] - scored["p10"]).mean())
+        if {"p10", "p90"}.issubset(scored.columns)
+        else np.nan
+    )
+    out = {
+        "n": int(len(scored)),
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error.to_numpy() ** 2))),
+        "bias": float(error.mean()),
+        "coverage_80": float(covered) if pd.notna(covered) else None,
+        "interval_width": width if pd.notna(width) else None,
+        "wrmsse": None,
+    }
+    if not compute_wrmsse:
+        return out
+    work = scored.rename(columns={"actual_mw": "demand_mw"}).copy()
+    if "settlement_period" in work.columns:
+        work["period_band"] = work["settlement_period"].map(_period_band)
+    try:
+        indo = fetch_indo(
+            (pd.Timestamp.now(tz=LONDON_TZ) - pd.Timedelta(days=56)).strftime("%Y-%m-%d"),
+            date.today().isoformat(),
+        )
+        scale = _naive_scale_mse(indo, "30min", 336)
+        if np.isfinite(scale) and scale > 0:
+            out["wrmsse"] = float(_wrmsse(work, scale))
+    except Exception:  # noqa: BLE001 — live board must still render
+        out["wrmsse"] = None
+    return out
+
+
+def _issue_stamp(frame: pd.DataFrame) -> str | None:
+    if frame.empty or "issued_at" not in frame.columns:
+        return None
+    return pd.Timestamp(frame["issued_at"].iloc[0]).isoformat()
+
+
+def _actuals_before(forecast: pd.DataFrame, *, hours: int) -> list[dict]:
+    """INDO covering the same length as the freeze, ending at its first timestamp."""
+    if forecast is None or forecast.empty or "timestamp" not in forecast.columns:
+        return []
+    end = _as_utc(forecast["timestamp"].min())
+    return _indo_records(end - pd.Timedelta(hours=hours), end)
+
+
+def _indo_records(start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
+    """Half-hourly INDO between start (inclusive) and end (exclusive), UTC."""
+    start = _as_utc(start)
+    end = _as_utc(end)
+    if end <= start:
+        return []
+    begin = start.tz_convert(LONDON_TZ).strftime("%Y-%m-%d")
+    last = (end.tz_convert(LONDON_TZ) - pd.Timedelta(seconds=1)).strftime("%Y-%m-%d")
+    try:
+        indo = fetch_indo(begin, last)
+    except Exception:  # noqa: BLE001
+        return []
+    if indo.empty or "timestamp" not in indo.columns:
+        return []
+    indo = indo.copy()
+    indo["timestamp"] = pd.to_datetime(indo["timestamp"], utc=True)
+    indo = indo.loc[(indo["timestamp"] >= start) & (indo["timestamp"] < end)]
+    if indo.empty:
+        return []
+    out = pd.DataFrame(
+        {
+            "timestamp": indo["timestamp"],
+            "actual_mw": indo["demand_mw"],
+            "settlement_period": indo["settlement_period"] if "settlement_period" in indo.columns else None,
+        }
+    )
+    return _frame_records(out)
+
+
+MAX_INDO_AGE_MINUTES = LIVE_INDO_MAX_AGE_MINUTES
+LAG_MATCH_MW = 25.0
+
+
+def _iso_stamp(value) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    stamp = pd.Timestamp(value)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    return stamp.tz_convert("UTC").isoformat()
+
+
+def input_health(
+    preset: str,
+    window_start: pd.Timestamp | None,
+    *,
+    issued_at: pd.Timestamp | None = None,
+    rows: pd.DataFrame | None = None,
+) -> dict:
+    """Check frozen (or board) features: last INDO, short lags, missing hour columns."""
+    frozen = load_frozen(preset, window_start) if window_start is not None else pd.DataFrame()
+    source = frozen if not frozen.empty else (rows if rows is not None else pd.DataFrame())
+    empty = {
+        "ok": False,
+        "issues": ["no frozen inputs yet — the next issue will snapshot features"],
+        "has_frozen": False,
+        "last_indo_timestamp": None,
+        "last_indo_mw": None,
+        "demand_lag_1": None,
+        "demand_lag_2": None,
+        "demand_lag_48": None,
+        "demand_lag_336": None,
+        "indo_age_minutes": None,
+        "temperature_2m": None,
+        "missing_features": [],
+        "n_feature_rows": 0,
+    }
+    if source is None or source.empty:
+        return empty
+    row = source.iloc[0]
+    last_indo_ts = row["last_indo_timestamp"] if "last_indo_timestamp" in source.columns else pd.NaT
+    last_indo_mw = row["last_indo_mw"] if "last_indo_mw" in source.columns else np.nan
+    lag1 = row["demand_lag_1"] if "demand_lag_1" in source.columns else np.nan
+    lag2 = row["demand_lag_2"] if "demand_lag_2" in source.columns else np.nan
+    lag48 = row["demand_lag_48"] if "demand_lag_48" in source.columns else np.nan
+    lag336 = row["demand_lag_336"] if "demand_lag_336" in source.columns else np.nan
+    temp = row["temperature_2m"] if "temperature_2m" in source.columns else np.nan
+    if issued_at is None and rows is not None and not rows.empty and "issued_at" in rows.columns:
+        issued_at = rows["issued_at"].iloc[0]
+    age = None
+    if issued_at is not None and pd.notna(last_indo_ts):
+        age = (_as_utc(issued_at) - _as_utc(last_indo_ts)).total_seconds() / 60.0
+    issues: list[str] = []
+    missing: list[str] = []
+    if frozen.empty:
+        issues.append("frozen snapshot not stored for this window")
+    if pd.isna(lag1) or pd.isna(lag2):
+        issues.append("demand_lag_1/2 missing — hour model will not see recent INDO")
+    elif pd.notna(last_indo_mw) and abs(float(lag1) - float(last_indo_mw)) > LAG_MATCH_MW:
+        issues.append(
+            f"lag_1 is {float(lag1):.0f} MW but last INDO is {float(last_indo_mw):.0f} MW"
+        )
+    if age is not None and age > MAX_INDO_AGE_MINUTES:
+        issues.append(f"last INDO is {age:.0f} min old at issue — 30-minute call will lag the ramp")
+    if pd.isna(last_indo_mw):
+        issues.append("no last INDO on the live frame")
+    if pd.isna(lag48) or pd.isna(lag336):
+        issues.append("day/week lags missing")
+    if preset == NEXT30 and not frozen.empty:
+        for column in HOUR_FEATURE_COLUMNS:
+            if column not in frozen.columns:
+                missing.append(column)
+            elif frozen[column].isna().any():
+                missing.append(column)
+        if missing:
+            issues.append("missing/NaN hour features: " + ", ".join(missing[:8]))
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "has_frozen": not frozen.empty,
+        "last_indo_timestamp": _iso_stamp(last_indo_ts),
+        "last_indo_mw": None if pd.isna(last_indo_mw) else float(last_indo_mw),
+        "demand_lag_1": None if pd.isna(lag1) else float(lag1),
+        "demand_lag_2": None if pd.isna(lag2) else float(lag2),
+        "demand_lag_48": None if pd.isna(lag48) else float(lag48),
+        "demand_lag_336": None if pd.isna(lag336) else float(lag336),
+        "indo_age_minutes": None if age is None else float(age),
+        "temperature_2m": None if pd.isna(temp) else float(temp),
+        "missing_features": missing,
+        "n_feature_rows": int(len(frozen)),
+    }
+
+
+def next30_input_audit(frame: pd.DataFrame, *, limit: int = 12, use_network: bool = True) -> dict:
+    """For recent 30-minute calls, compare P50 to the INDO that should have been on lag_1."""
+    empty = {"n": 0, "stale_share": None, "rows": []}
+    if frame is None or frame.empty or "p50" not in frame.columns:
+        return empty
+    indo = pd.DataFrame()
+    if use_network:
+        try:
+            start = (pd.Timestamp.now(tz=LONDON_TZ) - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+            indo = fetch_indo(start, date.today().isoformat())
+        except Exception:  # noqa: BLE001
+            indo = pd.DataFrame()
+        if not indo.empty:
+            indo = indo.copy()
+            indo["timestamp"] = pd.to_datetime(indo["timestamp"], utc=True)
+            indo = indo.sort_values("timestamp")
+    work = frame.dropna(subset=["p50"]).copy()
+    work["issued_at"] = pd.to_datetime(work["issued_at"], utc=True) if "issued_at" in work.columns else pd.NaT
+    work = work.sort_values("issued_at").tail(limit)
+    rows = []
+    stale = 0
+    for _, row in work.iterrows():
+        issued = _as_utc(row["issued_at"]) if pd.notna(row.get("issued_at")) else _as_utc(row["timestamp"])
+        last_mw = None
+        last_ts = None
+        if not indo.empty:
+            available = indo.loc[indo["timestamp"] + pd.Timedelta(minutes=30) <= issued]
+            last = available.iloc[-1] if not available.empty else None
+            if last is not None:
+                last_mw = float(last["demand_mw"])
+                last_ts = last["timestamp"]
+        elif "last_indo_mw" in work.columns and pd.notna(row.get("last_indo_mw")):
+            last_mw = float(row["last_indo_mw"])
+            last_ts = row["last_indo_timestamp"] if "last_indo_timestamp" in work.columns else None
+        stored = row["demand_lag_1"] if "demand_lag_1" in work.columns else np.nan
+        p50 = float(row["p50"])
+        actual = row["actual_mw"] if "actual_mw" in work.columns else np.nan
+        used = float(stored) if pd.notna(stored) else None
+        lag_gap = abs(used - last_mw) if used is not None and last_mw is not None else None
+        p50_gap = abs(p50 - last_mw) if last_mw is not None else None
+        is_stale = (lag_gap is not None and lag_gap > 400) or (
+            lag_gap is None and p50_gap is not None and p50_gap > 1500
+        )
+        if is_stale:
+            stale += 1
+        rows.append(
+            {
+                "issued_at": issued.isoformat(),
+                "timestamp": _iso_stamp(row["timestamp"]),
+                "p50": p50,
+                "actual_mw": None if pd.isna(actual) else float(actual),
+                "demand_lag_1": used,
+                "available_indo_mw": last_mw,
+                "available_indo_timestamp": _iso_stamp(last_ts) if last_ts is not None else None,
+                "stale_lags": bool(is_stale),
+            }
+        )
+    return {
+        "n": int(len(work)),
+        "stale_share": (stale / len(work)) if len(work) else None,
+        "rows": rows,
+    }
+
+
+def _window_payload(
+    preset: str,
+    window_start: pd.Timestamp | None,
+    board: pd.DataFrame | None = None,
+    *,
+    wrmsse: float | None = None,
+) -> dict:
+    rows = _window_rows(preset, window_start, board)
+    scored = rows.dropna(subset=["actual_mw", "p50"]) if not rows.empty else rows
+    metrics = preset_metrics(rows, compute_wrmsse=False)
+    if wrmsse is not None:
+        metrics["wrmsse"] = wrmsse
+    return {
+        "window_start": pd.Timestamp(window_start).isoformat() if window_start is not None else None,
+        "issued_at": _issue_stamp(rows),
+        "n": int(len(rows)),
+        "scored": int(len(scored)) if scored is not None else 0,
+        "metrics": metrics,
+        "rows": _frame_records(rows),
+        "has_frozen": window_start is not None and _frozen_path(preset, window_start).exists(),
+        "inputs": input_health(preset, window_start, rows=rows),
+    }
+
+
+def _previous_actuals(preset: str, windows: list, board: pd.DataFrame) -> list[dict]:
+    """Yesterday / last week from the previous freeze on disk — no Insights call."""
+    if len(windows) < 2:
+        return []
+    rows = _window_rows(preset, windows[1], board)
+    if rows.empty or "actual_mw" not in rows.columns:
+        return []
+    keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in rows.columns]
+    return _frame_records(rows.loc[:, keep].dropna(subset=["actual_mw"]))
+
+
+def board_payload(*, refresh: bool = False) -> dict:
+    """Dashboard JSON. Default path is local parquet only so the page stays fast."""
+    if refresh:
+        import_legacy_next30()
+        refresh_actuals()
+        refresh_wrmsse_cache()
+        _BOARD_CACHE["payload"] = None
+    elif _BOARD_CACHE["payload"] is not None:
+        age = time.monotonic() - float(_BOARD_CACHE["at"])
+        if age < _BOARD_CACHE_S:
+            return _BOARD_CACHE["payload"]
+    board = load_board()
+    wrmsse = load_wrmsse_cache()
+    now = london_now()
+    now_utc = now.tz_convert("UTC")
+    next30 = _preset_frame(NEXT30, board).copy()
+    if not next30.empty:
+        next30["timestamp"] = pd.to_datetime(next30["timestamp"], utc=True)
+        next30 = next30.sort_values("timestamp")
+    live30 = next30.iloc[0:0]
+    if not next30.empty:
+        waiting = next30
+        if "actual_mw" in next30.columns:
+            waiting = next30.loc[next30["actual_mw"].isna()].sort_values("timestamp")
+        live30 = waiting.iloc[:1] if not waiting.empty else next30.iloc[-1:]
+    day_windows = _windows(DAY, board)
+    week_windows = _windows(WEEK, board)
+    history30 = next30.copy()
+    if not history30.empty:
+        if "issued_at" in history30.columns:
+            history30 = history30.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
+        cutoff = now_utc - pd.Timedelta(hours=6)
+        history30 = history30.loc[history30["timestamp"] >= cutoff]
+        if not live30.empty:
+            cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True)
+            history30 = history30.loc[history30["timestamp"] <= cap]
+        history30 = history30.sort_values("timestamp")
+    live_window = live30["window_start"].iloc[0] if not live30.empty else None
+    n30_metrics = preset_metrics(next30, compute_wrmsse=False)
+    n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
+    payload = {
+        "as_of": now.isoformat(),
+        "next30": {
+            **_window_payload(NEXT30, live_window, board, wrmsse=wrmsse.get(NEXT30)),
+            "current": _frame_records(live30)[:1],
+            "history": _frame_records(history30),
+            "metrics": n30_metrics,
+            "audit": next30_input_audit(next30, use_network=False),
+        },
+        "day": {
+            "current": _window_payload(DAY, day_windows[0] if day_windows else None, board, wrmsse=wrmsse.get(DAY)),
+            "previous": _window_payload(DAY, day_windows[1] if len(day_windows) > 1 else None, board),
+            "previous_actuals": _previous_actuals(DAY, day_windows, board),
+        },
+        "week": {
+            "current": _window_payload(WEEK, week_windows[0] if week_windows else None, board, wrmsse=wrmsse.get(WEEK)),
+            "previous": _window_payload(WEEK, week_windows[1] if len(week_windows) > 1 else None, board),
+            "previous_actuals": _previous_actuals(WEEK, week_windows, board),
+        },
+    }
+    _BOARD_CACHE["at"] = time.monotonic()
+    _BOARD_CACHE["payload"] = payload
+    return payload
+
+
+def forecast_csv(preset: str, which: str = "current") -> str:
+    windows = _windows(preset)
+    if not windows:
+        return ""
+    window = windows[0] if which != "previous" else (windows[1] if len(windows) > 1 else windows[0])
+    rows = _window_rows(preset, window)
+    return _to_csv(rows)
+
+
+def frozen_csv(preset: str, which: str = "current") -> str:
+    windows = _windows(preset)
+    if not windows:
+        return ""
+    window = windows[0] if which != "previous" else (windows[1] if len(windows) > 1 else windows[0])
+    return _to_csv(load_frozen(preset, window))
+
+
+def _iso_utc_series(series: pd.Series) -> pd.Series:
+    stamp = pd.to_datetime(series, utc=True)
+    formatted = stamp.dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    return formatted.where(stamp.notna(), None)
+
+
+def _to_csv(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return ""
+    work = frame.copy()
+    for column in work.columns:
+        if pd.api.types.is_datetime64_any_dtype(work[column]):
+            work[column] = _iso_utc_series(work[column])
+    buf = StringIO()
+    work.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
+def scored_frame(*, latest_issue: bool = True) -> pd.DataFrame:
+    """Elapsed rows with INDO on the legacy hourly archive."""
+    archive = load_archive()
+    if archive.empty or "actual_mw" not in archive.columns:
+        return archive
+    out = archive.dropna(subset=["actual_mw", "p50"]).copy()
+    if "settlement_period" in out.columns and out["settlement_period"].notna().any():
+        out = out.loc[out["settlement_period"].notna()]
+    if latest_issue and not out.empty and {"issued_at", "mode", "timestamp"}.issubset(out.columns):
+        out = out.sort_values("issued_at").drop_duplicates(subset=["mode", "timestamp"], keep="last")
+    return out
+
+
+def live_metrics() -> pd.DataFrame:
+    scored = scored_frame()
+    if scored.empty:
+        return pd.DataFrame(columns=["split", "metric", "value"])
+    return validation_metrics(scored)
+
+
+def latest_forecast(mode: str = SHORT) -> pd.DataFrame:
+    archive = load_archive()
+    if archive.empty:
+        return archive
+    if mode in archive["mode"].to_numpy():
+        archive = archive.loc[archive["mode"] == mode]
+    latest = archive["issued_at"].max()
+    return archive.loc[archive["issued_at"] == latest].sort_values("timestamp")
+
+
+def snapshot() -> dict:
+    archive = load_archive()
+    scored = scored_frame()
+    metrics = live_metrics()
+    issued = None
+    if not archive.empty:
+        issued = pd.Timestamp(archive["issued_at"].max()).isoformat()
+    return {
+        "issued_at": issued,
+        "archive_rows": int(len(archive)),
+        "scored_rows": int(len(scored)),
+        "metrics": metrics.to_dict(orient="records"),
+        "as_of": london_now().isoformat(),
+        "today": date.today().isoformat(),
+    }
+
+
+def _frame_records(frame: pd.DataFrame, limit: int | None = None) -> list[dict]:
+    if frame.empty:
+        return []
+    work = frame.copy()
+    if limit is not None:
+        work = work.tail(limit)
+    for column in work.columns:
+        if pd.api.types.is_datetime64_any_dtype(work[column]):
+            work[column] = _iso_utc_series(work[column])
+    return json.loads(work.to_json(orient="records"))
+
+
+def seconds_until_half_hour() -> float:
+    """Sleep until :10 or :40 London so the previous settlement period's INDO is out."""
+    now = london_now()
+    minute = int(now.minute)
+    second = float(now.second) + now.microsecond / 1e6
+    if minute < 10:
+        wait = (10 - minute) * 60 - second
+    elif minute < 40:
+        wait = (40 - minute) * 60 - second
+    else:
+        wait = (70 - minute) * 60 - second
+    return max(5.0, wait + 5.0)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Capture and score live GB demand forecasts.")
+    parser.add_argument("command", choices=("capture", "tick", "refresh", "score", "status", "board"))
+    args = parser.parse_args(argv)
+    if args.command == "capture":
+        print(json.dumps(capture(), indent=2))
+        return
+    if args.command == "tick":
+        print(json.dumps(tick_presets(), indent=2, default=str))
+        return
+    if args.command == "refresh":
+        print(json.dumps(refresh_actuals(), indent=2))
+        return
+    if args.command == "score":
+        refresh_actuals()
+        print(live_metrics().to_string(index=False))
+        return
+    if args.command == "board":
+        print(json.dumps(board_payload(), indent=2, default=str)[:4000])
+        return
+    print(json.dumps(snapshot(), indent=2))
+
+
+if __name__ == "__main__":
+    main()
