@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from energy_forecast.live import (
     NEXT30,
@@ -42,10 +43,11 @@ def _check_token(authorization: str | None) -> None:
 
 
 async def _capture_loop() -> None:
-    await asyncio.sleep(5)
+    """Forecasts run in a worker thread so GET / and GET /board stay responsive."""
+    await asyncio.sleep(2)
     while True:
         try:
-            tick_presets()
+            await asyncio.to_thread(tick_presets)
         except Exception as exc:  # noqa: BLE001 — loop must not die
             print(f"live capture failed: {exc}")
         await asyncio.sleep(seconds_until_half_hour())
@@ -65,9 +67,21 @@ app = FastAPI(title="GB demand forecast", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
+_STATIC = Path(__file__).resolve().parent / "static"
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.get("/chart.js")
+def chart_js() -> FileResponse:
+    return FileResponse(
+        _STATIC / "chart.umd.min.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
 
 
 @app.get("/status")
@@ -207,8 +221,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>GB demand live score</title>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     :root { font-family: Georgia, serif; color: #1a1a1a; background: #f7f4ee; }
     body { max-width: 1400px; margin: 24px auto; padding: 0 16px 40px; }
@@ -239,7 +251,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <p class="muted">Week freeze at Monday 00:00 London. Day freeze at midnight. Next-30-minute call every half-hour. Times are Europe/London. INDO joins after each settlement period. Re-issue lives on each chart: week/day replace that freeze; next-30 only moves the live dots, not the pale history.</p>
   <p>
     <button type="button" id="capture">Issue due presets</button>
-    <span class="muted" id="note"></span>
+    <span class="muted" id="note">Loading board…</span>
   </p>
 
   <section class="panel">
@@ -297,6 +309,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
   </div>
 
+  <script src="/chart.js"></script>
   <script>
     const fmt = (n, d=0) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
     const charts = {};
@@ -560,7 +573,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       await load();
       waitForIndo();
     }
-    load();
+    load().then(() => { document.getElementById("note").textContent = ""; }).catch((err) => {
+      document.getElementById("note").textContent = String(err);
+    });
+    setInterval(load, 20000);
     waitForIndo();
   </script>
 </body>

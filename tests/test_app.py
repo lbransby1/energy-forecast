@@ -17,12 +17,21 @@ def test_dashboard_html():
     response = client.get("/")
     assert response.status_code == 200
     assert "GB National Demand" in response.text
+    assert "/chart.js" in response.text
+    assert "cdn.jsdelivr.net" not in response.text
+
+
+def test_chart_js_is_local():
+    response = client.get("/chart.js")
+    assert response.status_code == 200
+    assert len(response.content) > 50_000
 
 
 def test_board_json_shape(monkeypatch):
     import pandas as pd
 
     monkeypatch.setattr("energy_forecast.live.load_board", lambda: pd.DataFrame())
+    monkeypatch.setattr("energy_forecast.live.load_context_actuals", lambda: pd.DataFrame())
     monkeypatch.setattr("energy_forecast.live.fetch_indo", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")))
     from energy_forecast.live import _BOARD_CACHE
 

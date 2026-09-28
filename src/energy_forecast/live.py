@@ -6,6 +6,7 @@ import argparse
 import hmac
 import json
 import os
+import threading
 import time
 from datetime import date
 from io import StringIO
@@ -29,6 +30,7 @@ from energy_forecast.settlement import LONDON_TZ
 
 ARCHIVE_NAME = "archive.parquet"
 BOARD_NAME = "board.parquet"
+CONTEXT_NAME = "context_actuals.parquet"
 NEXT30 = "next30"
 DAY = "day"
 WEEK = "week"
@@ -36,6 +38,7 @@ PRESETS = (NEXT30, DAY, WEEK)
 WEEK_PASSWORD_FILE = "week_reissue_password"
 _BOARD_CACHE: dict = {"at": 0.0, "payload": None}
 _BOARD_CACHE_S = 2.0
+_TICK_LOCK = threading.RLock()
 
 
 class WeekReissueLocked(PermissionError):
@@ -75,6 +78,77 @@ def archive_path():
 def board_path():
     ensure_data_dirs()
     return DATA_LIVE / BOARD_NAME
+
+
+def context_path():
+    ensure_data_dirs()
+    return DATA_LIVE / CONTEXT_NAME
+
+
+def load_context_actuals() -> pd.DataFrame:
+    """Published INDO for chart context (yesterday / last week / last 6h). Local file only."""
+    path = context_path()
+    if not path.exists():
+        return pd.DataFrame(columns=["timestamp", "actual_mw", "settlement_period"])
+    out = pd.read_parquet(path)
+    if "timestamp" in out.columns:
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    if "actual_mw" not in out.columns and "demand_mw" in out.columns:
+        out = out.rename(columns={"demand_mw": "actual_mw"})
+    return out
+
+
+def save_context_actuals(frame: pd.DataFrame) -> None:
+    keep = [column for column in ("timestamp", "actual_mw", "settlement_period", "settlement_date") if column in frame.columns]
+    frame.loc[:, keep].sort_values("timestamp").reset_index(drop=True).to_parquet(context_path(), index=False)
+
+
+def refresh_context_actuals() -> dict:
+    """Fetch last week of INDO so charts have history without a previous freeze on disk."""
+    now = london_now()
+    start = week_window(now) - pd.Timedelta(days=7)
+    start_date = start.tz_convert(LONDON_TZ).strftime("%Y-%m-%d")
+    try:
+        indo = fetch_indo(start_date, date.today().isoformat())
+    except Exception as exc:  # noqa: BLE001 — keep the previous context file
+        print(f"context INDO fetch failed: {exc}")
+        return {"rows": int(len(load_context_actuals())), "error": str(exc)}
+    if indo.empty:
+        return {"rows": 0}
+    out = indo.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    if "demand_mw" in out.columns:
+        out = out.rename(columns={"demand_mw": "actual_mw"})
+    save_context_actuals(out)
+    _BOARD_CACHE["payload"] = None
+    return {"rows": int(len(out))}
+
+
+def _slice_actuals(context: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if context.empty or "timestamp" not in context.columns:
+        return context.iloc[0:0].copy() if hasattr(context, "iloc") else pd.DataFrame()
+    ts = pd.to_datetime(context["timestamp"], utc=True)
+    mask = (ts >= _as_utc(start)) & (ts < _as_utc(end))
+    return context.loc[mask].copy()
+
+
+def _overlay_actuals(rows: pd.DataFrame, context: pd.DataFrame) -> pd.DataFrame:
+    """Stamp published INDO onto forecast rows for display (GET stays local)."""
+    if rows.empty or context.empty or "timestamp" not in context.columns:
+        return rows
+    out = rows.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    lookup = (
+        context.dropna(subset=["actual_mw"])
+        .drop_duplicates("timestamp")
+        .set_index("timestamp")["actual_mw"]
+    )
+    mapped = out["timestamp"].map(lookup)
+    if "actual_mw" not in out.columns:
+        out["actual_mw"] = mapped
+    else:
+        out["actual_mw"] = pd.to_numeric(out["actual_mw"], errors="coerce").combine_first(mapped)
+    return out
 
 
 def frozen_dir():
@@ -244,6 +318,14 @@ def _run_pack_retry(role: str, hours: float, *, retry: bool) -> tuple[pd.DataFra
 
 def capture_preset(preset: str, *, force: bool = False, week_password: str | None = None) -> dict:
     """Issue one board preset. Day/week skip if that window already exists."""
+    with _TICK_LOCK:
+        result = _capture_preset(preset, force=force, week_password=week_password)
+        result["context"] = refresh_context_actuals()
+        result["actuals"] = refresh_actuals()
+        return result
+
+
+def _capture_preset(preset: str, *, force: bool = False, week_password: str | None = None) -> dict:
     if preset not in PRESETS:
         raise ValueError(f"preset must be one of {PRESETS}")
     now = london_now()
@@ -334,13 +416,15 @@ def import_legacy_next30() -> int:
 
 def tick_presets(*, force: bool = False, week_password: str | None = None) -> dict:
     """Issue the 30-minute call, and the day/week freeze if that window is empty."""
-    imported = import_legacy_next30()
-    results = {"imported_next30": imported, "next30": capture_preset(NEXT30, force=True)}
-    results["day"] = capture_preset(DAY, force=force)
-    results["week"] = capture_preset(WEEK, force=force, week_password=week_password)
-    results["actuals"] = refresh_actuals()
-    results["wrmsse"] = refresh_wrmsse_cache()
-    return results
+    with _TICK_LOCK:
+        imported = import_legacy_next30()
+        results = {"imported_next30": imported, "next30": _capture_preset(NEXT30, force=True)}
+        results["day"] = _capture_preset(DAY, force=force)
+        results["week"] = _capture_preset(WEEK, force=force, week_password=week_password)
+        results["context"] = refresh_context_actuals()
+        results["actuals"] = refresh_actuals()
+        results["wrmsse"] = refresh_wrmsse_cache()
+        return results
 
 
 def refresh_actuals() -> dict:
@@ -700,8 +784,11 @@ def _window_payload(
     board: pd.DataFrame | None = None,
     *,
     wrmsse: float | None = None,
+    context: pd.DataFrame | None = None,
 ) -> dict:
     rows = _window_rows(preset, window_start, board)
+    if context is not None:
+        rows = _overlay_actuals(rows, context)
     scored = rows.dropna(subset=["actual_mw", "p50"]) if not rows.empty else rows
     metrics = preset_metrics(rows, compute_wrmsse=False)
     if wrmsse is not None:
@@ -718,15 +805,67 @@ def _window_payload(
     }
 
 
-def _previous_actuals(preset: str, windows: list, board: pd.DataFrame) -> list[dict]:
-    """Yesterday / last week from the previous freeze on disk — no Insights call."""
-    if len(windows) < 2:
+def _previous_actuals(
+    preset: str,
+    windows: list,
+    board: pd.DataFrame,
+    context: pd.DataFrame | None = None,
+) -> list[dict]:
+    """Yesterday / last week INDO. Prefer the previous freeze; else the context file."""
+    if len(windows) >= 2:
+        rows = _window_rows(preset, windows[1], board)
+        if not rows.empty and "actual_mw" in rows.columns:
+            keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in rows.columns]
+            scored = _frame_records(rows.loc[:, keep].dropna(subset=["actual_mw"]))
+            if scored:
+                return scored
+    now = london_now()
+    if preset == DAY:
+        end = day_window(now)
+        start = end - pd.Timedelta(days=1)
+    else:
+        end = week_window(now)
+        start = end - pd.Timedelta(days=7)
+    chunk = _slice_actuals(context if context is not None else load_context_actuals(), start, end)
+    if chunk.empty:
         return []
-    rows = _window_rows(preset, windows[1], board)
-    if rows.empty or "actual_mw" not in rows.columns:
-        return []
-    keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in rows.columns]
-    return _frame_records(rows.loc[:, keep].dropna(subset=["actual_mw"]))
+    keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in chunk.columns]
+    return _frame_records(chunk.loc[:, keep].dropna(subset=["actual_mw"]))
+
+
+def _next30_history(
+    next30: pd.DataFrame,
+    live30: pd.DataFrame,
+    now_utc: pd.Timestamp,
+    context: pd.DataFrame,
+) -> pd.DataFrame:
+    """Last 6h of issued calls, with INDO filled in even when those periods were never frozen."""
+    history = next30.copy()
+    if not history.empty:
+        if "issued_at" in history.columns:
+            history = history.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
+        cutoff = now_utc - pd.Timedelta(hours=6)
+        history = history.loc[pd.to_datetime(history["timestamp"], utc=True) >= cutoff]
+        if not live30.empty:
+            cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True)
+            history = history.loc[pd.to_datetime(history["timestamp"], utc=True) <= cap]
+    history = _overlay_actuals(history, context)
+    cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True) if not live30.empty else now_utc
+    trail = _slice_actuals(context, now_utc - pd.Timedelta(hours=6), cap + pd.Timedelta(seconds=1))
+    if trail.empty:
+        return history.sort_values("timestamp") if not history.empty else history
+    have = (
+        set(pd.to_datetime(history["timestamp"], utc=True))
+        if not history.empty and "timestamp" in history.columns
+        else set()
+    )
+    extra = trail.loc[~pd.to_datetime(trail["timestamp"], utc=True).isin(have)].copy()
+    if extra.empty:
+        return history.sort_values("timestamp") if not history.empty else history
+    for column in ("p10", "p50", "p90"):
+        extra[column] = np.nan
+    combined = extra if history.empty else pd.concat([history, extra], ignore_index=True)
+    return combined.sort_values("timestamp")
 
 
 def board_payload(*, refresh: bool = False) -> dict:
@@ -741,6 +880,7 @@ def board_payload(*, refresh: bool = False) -> dict:
         if age < _BOARD_CACHE_S:
             return _BOARD_CACHE["payload"]
     board = load_board()
+    context = load_context_actuals()
     wrmsse = load_wrmsse_cache()
     now = london_now()
     now_utc = now.tz_convert("UTC")
@@ -756,37 +896,28 @@ def board_payload(*, refresh: bool = False) -> dict:
         live30 = waiting.iloc[:1] if not waiting.empty else next30.iloc[-1:]
     day_windows = _windows(DAY, board)
     week_windows = _windows(WEEK, board)
-    history30 = next30.copy()
-    if not history30.empty:
-        if "issued_at" in history30.columns:
-            history30 = history30.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
-        cutoff = now_utc - pd.Timedelta(hours=6)
-        history30 = history30.loc[history30["timestamp"] >= cutoff]
-        if not live30.empty:
-            cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True)
-            history30 = history30.loc[history30["timestamp"] <= cap]
-        history30 = history30.sort_values("timestamp")
+    history30 = _next30_history(next30, live30, now_utc, context)
     live_window = live30["window_start"].iloc[0] if not live30.empty else None
-    n30_metrics = preset_metrics(next30, compute_wrmsse=False)
+    n30_metrics = preset_metrics(_overlay_actuals(next30, context), compute_wrmsse=False)
     n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
     payload = {
         "as_of": now.isoformat(),
         "next30": {
-            **_window_payload(NEXT30, live_window, board, wrmsse=wrmsse.get(NEXT30)),
+            **_window_payload(NEXT30, live_window, board, wrmsse=wrmsse.get(NEXT30), context=context),
             "current": _frame_records(live30)[:1],
             "history": _frame_records(history30),
             "metrics": n30_metrics,
             "audit": next30_input_audit(next30, use_network=False),
         },
         "day": {
-            "current": _window_payload(DAY, day_windows[0] if day_windows else None, board, wrmsse=wrmsse.get(DAY)),
-            "previous": _window_payload(DAY, day_windows[1] if len(day_windows) > 1 else None, board),
-            "previous_actuals": _previous_actuals(DAY, day_windows, board),
+            "current": _window_payload(DAY, day_windows[0] if day_windows else None, board, wrmsse=wrmsse.get(DAY), context=context),
+            "previous": _window_payload(DAY, day_windows[1] if len(day_windows) > 1 else None, board, context=context),
+            "previous_actuals": _previous_actuals(DAY, day_windows, board, context),
         },
         "week": {
-            "current": _window_payload(WEEK, week_windows[0] if week_windows else None, board, wrmsse=wrmsse.get(WEEK)),
-            "previous": _window_payload(WEEK, week_windows[1] if len(week_windows) > 1 else None, board),
-            "previous_actuals": _previous_actuals(WEEK, week_windows, board),
+            "current": _window_payload(WEEK, week_windows[0] if week_windows else None, board, wrmsse=wrmsse.get(WEEK), context=context),
+            "previous": _window_payload(WEEK, week_windows[1] if len(week_windows) > 1 else None, board, context=context),
+            "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
         },
     }
     _BOARD_CACHE["at"] = time.monotonic()

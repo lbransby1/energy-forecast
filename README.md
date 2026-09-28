@@ -50,7 +50,7 @@ One **uvicorn** worker (file-backed state is not safe across multiple writers). 
 |---|---|---|
 | `GET /` `GET /health` | milliseconds | HTML / `{ok: true}` |
 | `GET /board` | local parquet | charts + MAE/coverage; **no Insights/Open-Meteo** |
-| `POST /capture` | seconds–tens of seconds | weather fetch, LightGBM, freeze, INDO join, WRMSSE cache |
+| `POST /capture` | seconds–tens of seconds, **background thread** | weather fetch, LightGBM, freeze, INDO join, WRMSSE cache |
 
 WRMSSE needs 56 days of INDO. It is computed on the **capture loop**, cached in `data/live/wrmsse_cache.json`, and only *read* on `/board`.
 
@@ -94,6 +94,7 @@ Eval: 56-day holdout at display frequency; WRMSSE vs weekly seasonal naive (1.0 
 ## 4. Live scoring and safety
 
 - **Frozen feature parquet** at issue: weather, lags, last INDO. Day/week overwrites are the trial; week re-issue requires `WEEK_REISSUE_PASSWORD`.
+- **Context INDO** (`data/live/context_actuals.parquet`): last week of published outturn, written on the capture loop so a cold volume still shows yesterday / last week as the grey line. `GET /board` only reads the file.
 - Hour pack **stamps `lag_1`/`lag_2` from Insights** immediately before predict. If last INDO is older than 90 minutes, skip the 30-minute call.
 - Capture at **:10 and :40** so the previous SP is usually published.
 
