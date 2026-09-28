@@ -16,7 +16,8 @@ def test_health_is_fast_and_ok():
 def test_dashboard_html():
     response = client.get("/")
     assert response.status_code == 200
-    assert "GB National Demand" in response.text
+    assert "grid-demand.uk" in response.text
+    assert "Black — what actually happened" in response.text
     assert "/chart.js" in response.text
     assert "cdn.jsdelivr.net" not in response.text
 

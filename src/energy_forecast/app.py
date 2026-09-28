@@ -63,7 +63,7 @@ async def lifespan(_app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(title="GB demand forecast", lifespan=lifespan)
+app = FastAPI(title="grid-demand.uk", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -220,13 +220,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>GB demand live score</title>
+  <title>grid-demand.uk</title>
   <style>
     :root { font-family: Georgia, serif; color: #1a1a1a; background: #f7f4ee; }
     body { max-width: 1400px; margin: 24px auto; padding: 0 16px 40px; }
     h1 { font-size: 1.55rem; font-weight: 600; margin-bottom: 0.3rem; }
     h2 { font-size: 1.15rem; margin: 0; }
     .muted { color: #5c5c5c; font-size: 0.92rem; }
+    .lede { max-width: 52rem; margin: 0 0 12px; line-height: 1.45; }
+    .key { display: flex; flex-wrap: wrap; gap: 14px 22px; margin: 10px 0 4px; font-size: 0.92rem; }
+    .key span { display: inline-flex; align-items: center; gap: 8px; }
+    .swatch { width: 22px; height: 4px; border-radius: 1px; }
+    .swatch.black { background: #111; }
+    .swatch.red { background: #c45c26; height: 5px; }
+    .swatch.blue { background: #9bb8d3; }
     .panel { background: #fff; border: 1px solid #ddd4c4; padding: 14px 16px 10px; margin: 14px 0; }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 6px; }
@@ -247,8 +254,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>GB National Demand — three presets</h1>
-  <p class="muted">Week freeze at Monday 00:00 London. Day freeze at midnight. Next-30-minute call every half-hour. Times are Europe/London. INDO joins after each settlement period. Re-issue lives on each chart: week/day replace that freeze; next-30 only moves the live dots, not the pale history.</p>
+  <h1>grid-demand.uk</h1>
+  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official number arrived. Three views: the next week, the next day, and the next half-hour. Clocks are UK time. The black line only appears after each half-hour has finished.</p>
+  <p class="key" aria-label="Chart colour key">
+    <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>
+    <span><i class="swatch red"></i> Red — the central forecast (most likely demand)</span>
+    <span><i class="swatch blue"></i> Blue — a likely range (low to high). The black line should usually sit between them.</span>
+  </p>
   <p>
     <button type="button" id="capture">Issue due presets</button>
     <span class="muted" id="note">Loading board…</span>
