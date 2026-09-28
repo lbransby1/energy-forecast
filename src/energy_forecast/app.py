@@ -222,7 +222,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Grid Demand UK</title>
   <style>
-    :root { font-family: Georgia, serif; color: #1a1a1a; background: #f7f4ee; }
+    :root {
+      font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+      font-variant-numeric: lining-nums tabular-nums;
+      font-feature-settings: "tnum" 1, "lnum" 1;
+      color: #1a1a1a;
+      background: #f7f4ee;
+    }
     body { max-width: 1680px; margin: 24px auto; padding: 0 16px 40px; }
     h1 { font-size: 1.55rem; font-weight: 600; margin-bottom: 0.3rem; }
     h2 { font-size: 1.15rem; margin: 0; }
@@ -245,6 +251,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .panel.n30 { grid-area: n30; }
     .panel.eval { grid-area: eval; }
     .eval .cards { margin-top: 8px; }
+    table.eval-miss, table.audit { font-variant-numeric: lining-nums tabular-nums; }
     table.eval-miss { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 8px; }
     table.eval-miss th, table.eval-miss td { text-align: left; padding: 4px 5px; border-bottom: 1px solid #eee; }
     @media (max-width: 1100px) {
@@ -252,8 +259,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 6px; }
-    .card { border: 1px solid #eee; padding: 8px 10px; min-width: 92px; cursor: help; }
-    .card b { display: block; font-size: 1.15rem; }
+    .card { border: 1px solid #eee; padding: 8px 10px; min-width: 110px; min-height: 4.1rem; cursor: help; display: flex; flex-direction: column; justify-content: space-between; }
+    .card b { display: block; font-size: 1.05rem; font-weight: 600; line-height: 1.25; letter-spacing: 0; white-space: nowrap; font-variant-numeric: lining-nums tabular-nums; }
     .links a { margin-right: 12px; color: #1a1a1a; }
     button { font: inherit; padding: 8px 14px; cursor: pointer; }
     .panel button { font-size: 0.92rem; padding: 6px 12px; margin: 8px 0 4px; }
@@ -379,6 +386,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
     const fmt = (n, d=0) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
     const charts = {};
+    Chart.defaults.font.family = '"Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif';
 
     function londonParts(ts) {
       const date = new Date(ts);

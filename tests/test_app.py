@@ -23,7 +23,8 @@ def test_dashboard_html():
     assert "This chart is today" in response.text
     assert "How the guesses did" in response.text
     assert response.text.index('id="next30"') < response.text.index('id="n30-audit"')
-    assert "/chart.js" in response.text
+    assert "Segoe UI" in response.text
+    assert "Georgia" not in response.text
     assert "cdn.jsdelivr.net" not in response.text
 
 
