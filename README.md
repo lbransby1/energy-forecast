@@ -2,7 +2,7 @@
 
 Live **P10 / P50 / P90** forecast of Great Britain National Demand. Weather in, quantiles out, scored against Elexon Insights **INDO** after each settlement period. Built as a production service, not a notebook dump.
 
-This document is the architecture view for software and ML engineering. Skills narrative: [`TECHNICAL_WRITEUP.md`](TECHNICAL_WRITEUP.md).
+Source: [github.com/lbransby1/energy-forecast](https://github.com/lbransby1/energy-forecast). This document is the architecture view for software and ML engineering. Skills narrative: [`TECHNICAL_WRITEUP.md`](TECHNICAL_WRITEUP.md).
 
 ```
 Open-Meteo (ERA5 / forecast / Previous Runs)     NESO ND (historic CSV)
