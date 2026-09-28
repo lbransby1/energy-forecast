@@ -21,7 +21,8 @@ def test_dashboard_html():
     assert "Typical size of the miss" in response.text
     assert "This chart is the week ahead" in response.text
     assert "This chart is today" in response.text
-    assert "This chart is the last few hours" in response.text
+    assert "How the guesses did" in response.text
+    assert response.text.index('id="next30"') < response.text.index('id="n30-audit"')
     assert "/chart.js" in response.text
     assert "cdn.jsdelivr.net" not in response.text
 
@@ -44,4 +45,5 @@ def test_board_json_shape(monkeypatch):
     response = client.get("/board")
     assert response.status_code == 200
     body = response.json()
-    assert set(body) >= {"as_of", "next30", "day", "week"}
+    assert set(body) >= {"as_of", "next30", "day", "week", "eval"}
+    assert "scored" in body["eval"]

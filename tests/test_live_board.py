@@ -46,7 +46,7 @@ def test_board_payload_does_not_call_insights(monkeypatch):
     monkeypatch.setattr("energy_forecast.live.load_context_actuals", lambda: pd.DataFrame())
     payload = board_payload(refresh=False)
     assert "next30" in payload and "day" in payload and "week" in payload
-    assert payload["next30"]["metrics"]["n"] == 0
+    assert payload["eval"]["scored"] == 0
 
 
 def test_board_uses_context_indo_without_prior_freeze(monkeypatch):
@@ -72,3 +72,24 @@ def test_board_uses_context_indo_without_prior_freeze(monkeypatch):
     assert 25000.0 in day_mw
     assert 24000.0 in week_mw
     assert 26000.0 in hist_mw
+
+
+def test_evaluation_tags_outside_band_and_lags():
+    from energy_forecast.live import evaluation_payload
+
+    board = pd.DataFrame(
+        {
+            "preset": ["day", "next30"],
+            "timestamp": pd.to_datetime(["2026-09-28T10:00:00Z", "2026-09-28T10:30:00Z"]),
+            "p10": [24000.0, 24000.0],
+            "p50": [25000.0, 25000.0],
+            "p90": [26000.0, 26000.0],
+            "actual_mw": [28000.0, 25100.0],
+            "demand_lag_1": [20000.0, 25100.0],
+            "last_indo_mw": [25000.0, 25100.0],
+        }
+    )
+    out = evaluation_payload(board, pd.DataFrame())
+    assert out["scored"] == 2
+    assert out["outside_band"] == 1
+    assert out["lags"] == 1

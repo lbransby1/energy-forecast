@@ -868,6 +868,78 @@ def _next30_history(
     return combined.sort_values("timestamp")
 
 
+def evaluation_payload(
+    board: pd.DataFrame,
+    context: pd.DataFrame,
+    audit: dict | None = None,
+) -> dict:
+    """Tag scored rows for the validation panel. Local parquet only — no weather API."""
+    misses: list[dict] = []
+    scored_n = 0
+    outside = 0
+    lags = 0
+    large = 0
+    for preset in PRESETS:
+        frame = _overlay_actuals(_preset_frame(preset, board), context)
+        if frame.empty or "p50" not in frame.columns:
+            continue
+        work = frame.dropna(subset=["actual_mw", "p50"]).copy()
+        if work.empty:
+            continue
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+        if "issued_at" in work.columns:
+            work = work.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
+        work = work.reset_index(drop=True)
+        scored_n += int(len(work))
+        error = pd.to_numeric(work["actual_mw"], errors="coerce") - pd.to_numeric(work["p50"], errors="coerce")
+        work["error_mw"] = error
+        work["abs_error_mw"] = error.abs()
+        band = pd.Series(False, index=work.index)
+        if {"p10", "p90"}.issubset(work.columns):
+            band = (work["actual_mw"] < work["p10"]) | (work["actual_mw"] > work["p90"])
+        lag_issue = pd.Series(False, index=work.index)
+        if {"demand_lag_1", "last_indo_mw"}.issubset(work.columns):
+            lag_issue = (
+                pd.to_numeric(work["demand_lag_1"], errors="coerce")
+                - pd.to_numeric(work["last_indo_mw"], errors="coerce")
+            ).abs() > 400
+        for _, row in work.iterrows():
+            tags: list[str] = []
+            if bool(lag_issue.loc[row.name]):
+                tags.append("lags")
+                lags += 1
+            if bool(band.loc[row.name]):
+                tags.append("outside band")
+                outside += 1
+            elif float(row["abs_error_mw"]) >= 1500:
+                tags.append("large miss")
+                large += 1
+            misses.append(
+                {
+                    "preset": preset,
+                    "timestamp": _iso_stamp(row["timestamp"]),
+                    "p50": float(row["p50"]),
+                    "actual_mw": float(row["actual_mw"]),
+                    "error_mw": float(row["error_mw"]),
+                    "tag": tags[0] if tags else "typical",
+                }
+            )
+    misses.sort(key=lambda row: abs(row["error_mw"]), reverse=True)
+    audit = audit or {}
+    return {
+        "scored": scored_n,
+        "outside_band": outside,
+        "lags": lags,
+        "large_miss": large,
+        "stale_share": audit.get("stale_share"),
+        "weather": {
+            "ready": False,
+            "note": "Weather-vs-demand needs issued temperature compared with later actual weather. That fills in over a few days; this panel does not call the weather API.",
+        },
+        "worst": misses[:8],
+    }
+
+
 def board_payload(*, refresh: bool = False) -> dict:
     """Dashboard JSON. Default path is local parquet only so the page stays fast."""
     if refresh:
@@ -900,6 +972,7 @@ def board_payload(*, refresh: bool = False) -> dict:
     live_window = live30["window_start"].iloc[0] if not live30.empty else None
     n30_metrics = preset_metrics(_overlay_actuals(next30, context), compute_wrmsse=False)
     n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
+    audit = next30_input_audit(next30, use_network=False)
     payload = {
         "as_of": now.isoformat(),
         "next30": {
@@ -907,7 +980,7 @@ def board_payload(*, refresh: bool = False) -> dict:
             "current": _frame_records(live30)[:1],
             "history": _frame_records(history30),
             "metrics": n30_metrics,
-            "audit": next30_input_audit(next30, use_network=False),
+            "audit": audit,
         },
         "day": {
             "current": _window_payload(DAY, day_windows[0] if day_windows else None, board, wrmsse=wrmsse.get(DAY), context=context),
@@ -919,6 +992,7 @@ def board_payload(*, refresh: bool = False) -> dict:
             "previous": _window_payload(WEEK, week_windows[1] if len(week_windows) > 1 else None, board, context=context),
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
         },
+        "eval": evaluation_payload(board, context, audit),
     }
     _BOARD_CACHE["at"] = time.monotonic()
     _BOARD_CACHE["payload"] = payload

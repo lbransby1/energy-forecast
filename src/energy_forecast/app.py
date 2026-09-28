@@ -223,7 +223,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <title>Grid Demand UK</title>
   <style>
     :root { font-family: Georgia, serif; color: #1a1a1a; background: #f7f4ee; }
-    body { max-width: 1400px; margin: 24px auto; padding: 0 16px 40px; }
+    body { max-width: 1680px; margin: 24px auto; padding: 0 16px 40px; }
     h1 { font-size: 1.55rem; font-weight: 600; margin-bottom: 0.3rem; }
     h2 { font-size: 1.15rem; margin: 0; }
     .muted { color: #5c5c5c; font-size: 0.92rem; }
@@ -238,7 +238,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .swatch.black { background: #111; }
     .swatch.red { background: #c45c26; height: 5px; }
     .swatch.blue { background: #9bb8d3; }
-    .panel { background: #fff; border: 1px solid #ddd4c4; padding: 14px 16px 10px; margin: 14px 0; }
+    .panel { background: #fff; border: 1px solid #ddd4c4; padding: 14px 16px 10px; margin: 0; }
+    .board { display: grid; grid-template-columns: 1fr 1fr minmax(260px, 22rem); grid-template-areas: "week week eval" "day n30 eval"; gap: 14px; align-items: start; margin: 14px 0; }
+    .panel.week { grid-area: week; }
+    .panel.day { grid-area: day; }
+    .panel.n30 { grid-area: n30; }
+    .panel.eval { grid-area: eval; }
+    .eval .cards { margin-top: 8px; }
+    table.eval-miss { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 8px; }
+    table.eval-miss th, table.eval-miss td { text-align: left; padding: 4px 5px; border-bottom: 1px solid #eee; }
+    @media (max-width: 1100px) {
+      .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30" "eval"; }
+    }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 6px; }
     .card { border: 1px solid #eee; padding: 8px 10px; min-width: 92px; cursor: help; }
@@ -259,7 +270,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Grid Demand UK</h1>
-  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. There are three&nbsp;views: the coming week, the coming day, and the next half-hour. Times are UK. The black line is only drawn after each half-hour has ended.</p>
+  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. There are three&nbsp;views of the forecast (week, day, half-hour) and a check on finished half-hours on the right. Times are UK. The black line is only drawn after each half-hour has ended.</p>
   <p class="key" aria-label="Chart colour key">
     <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>
     <span><i class="swatch red"></i> Red — the central forecast (most likely demand)</span>
@@ -284,7 +295,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="muted" id="note">Loading board…</span>
   </p>
 
-  <section class="panel">
+  <div class="board">
+  <section class="panel week">
     <div class="head">
       <div>
         <h2>Next week</h2>
@@ -303,8 +315,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
   </section>
 
-  <div class="split">
-    <section class="panel">
+  <section class="panel eval">
+    <div class="head">
+      <div>
+        <h2>How the guesses did</h2>
+        <p class="muted" id="eval-note">Finished half-hours only.</p>
+      </div>
+    </div>
+    <p class="explain">This column is a check, not a new forecast. It looks at half-hours that already have a black line and tags the awkward ones. <b>Outside band</b> — actual missed the blue range (a spike the guess did not cover). <b>Lags</b> — the demand reading the half-hour model used did not match the official figure at issue time (a labelling / freshness problem). <b>Large miss</b> — red line was more than about 1.5 GW out, but still inside the blues. Weather-was-wrong is not scored here yet; that needs a few days of issued temperature vs later actual weather.</p>
+    <div class="cards" id="eval-cards"></div>
+    <p class="muted" id="eval-weather"></p>
+    <table class="eval-miss" id="eval-miss"></table>
+  </section>
+
+  <section class="panel day">
       <div class="head">
         <div>
           <h2>Next 24 hours</h2>
@@ -320,8 +344,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="cards" id="day-cards"></div>
       <button type="button" data-preset="day">Re-issue day</button>
       <div class="chart-wrap half"><canvas id="day"></canvas></div>
-    </section>
-    <section class="panel">
+  </section>
+  <section class="panel n30">
       <div class="head">
         <div>
           <h2>Next 30 minutes</h2>
@@ -335,6 +359,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <p class="explain">This chart is the last few hours, one guess per half-hour. Pale red is what was written at the time. The bright red and blue dots are the guess for the half-hour that has not finished yet, so there is no black line there. Black appears once the official outturn is published (usually a few minutes after the half-hour ends).</p>
       <div class="cards" id="n30-cards"></div>
+      <button type="button" data-preset="next30">Re-issue next 30</button>
+      <div class="chart-wrap half"><canvas id="next30"></canvas></div>
       <dl class="glossary" aria-label="Next 30 minute extra cards">
         <dt>Generated</dt>
         <dd>When this half-hour guess was written.</dd>
@@ -343,12 +369,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <dt>Live P50</dt>
         <dd>The current red-line guess, in megawatts, for that target half-hour.</dd>
       </dl>
-      <p class="explain">The status line under the boxes is a health check on the inputs used for the latest guess: last official outturn (and how old it is), the two most recent demand readings the model was given, and UK temperature. Green means those look complete; red means the guess was skipped or the inputs look wrong. The table is a short history of those checks. <b>lag_1</b> is the latest demand the model used; <b>INDO then</b> is the official figure available at issue time; <b>stale lags</b> means those two disagreed, so the guess may be off.</p>
+      <p class="explain">Logs for the half-hour model sit under the chart so it lines up with today. The status line is a health check on the latest guess: last official outturn (and how old it is), the two most recent demand readings the model was given, and UK temperature. Green means those look complete; red means the guess was skipped or the inputs look wrong. The table is a short history. <b>lag_1</b> is the latest demand the model used; <b>INDO then</b> is the official figure available at issue time; <b>stale lags</b> means those two disagreed, so the guess may be off.</p>
       <p class="muted" id="n30-inputs"></p>
       <table class="audit" id="n30-audit"></table>
-      <button type="button" data-preset="next30">Re-issue next 30</button>
-      <div class="chart-wrap half"><canvas id="next30"></canvas></div>
-    </section>
+  </section>
   </div>
 
   <script src="/chart.js"></script>
@@ -530,6 +554,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       drawWindow("week", week.previous_actuals, week.current, "Last week’s actual use, then this week’s forecast", "week");
       drawWindow("day", day.previous_actuals, day.current, "Yesterday’s actual use, then today’s forecast", "day");
       drawNext30(n30.history || [], live);
+      drawEval(board.eval || {});
+    }
+
+    function drawEval(ev) {
+      const scored = ev.scored || 0;
+      document.getElementById("eval-note").textContent = scored
+        ? (scored + " finished half-hours scored")
+        : "Waiting for official outturn on issued guesses.";
+      const cards = document.getElementById("eval-cards");
+      const stale = ev.stale_share != null ? (100 * ev.stale_share).toFixed(0) + "%" : "—";
+      cards.innerHTML = `
+        <div class="card" title="Half-hours with both a guess and an official number."><span class="muted">Scored</span><b>${fmt(scored)}</b></div>
+        <div class="card" title="Actual missed the blue range."><span class="muted">Outside band</span><b>${fmt(ev.outside_band)}</b></div>
+        <div class="card" title="Half-hour model used a demand reading that did not match the official figure."><span class="muted">Lags</span><b>${fmt(ev.lags)}</b></div>
+        <div class="card" title="Red line more than about 1.5 GW out, but still inside the blues."><span class="muted">Large miss</span><b>${fmt(ev.large_miss)}</b></div>
+        <div class="card" title="Share of recent half-hour issues where lag_1 disagreed with INDO."><span class="muted">Stale share</span><b>${stale}</b></div>`;
+      const weather = document.getElementById("eval-weather");
+      weather.textContent = (ev.weather && ev.weather.note) || "";
+      const worst = ev.worst || [];
+      const table = document.getElementById("eval-miss");
+      if (!worst.length) {
+        table.innerHTML = "";
+        return;
+      }
+      table.innerHTML = "<thead><tr><th>When</th><th>View</th><th>Guess</th><th>Actual</th><th>Miss</th><th>Tag</th></tr></thead><tbody>"
+        + worst.map((row) => `<tr>
+            <td>${london(row.timestamp)}</td>
+            <td>${row.preset || ""}</td>
+            <td>${fmt(row.p50)}</td>
+            <td>${fmt(row.actual_mw)}</td>
+            <td>${fmt(row.error_mw)}</td>
+            <td>${row.tag || ""}</td>
+          </tr>`).join("")
+        + "</tbody>";
     }
 
     function drawNext30(hist, live) {
