@@ -344,10 +344,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="links">
           <a href="/download/day?which=current">Forecast CSV</a>
           <a href="/download/day/frozen?which=current">Frozen inputs</a>
-          <a href="/download/day?which=previous">Yesterday</a>
+          <a href="/download/day?which=previous">Yesterday forecast CSV</a>
         </div>
       </div>
-      <p class="explain">This chart is today. The left-hand black line is yesterday’s actual use. From midnight the red and blue lines are today’s forecast. As the day goes on, black is drawn over the forecast for hours that have already finished. The boxes score only those finished hours, not the evening still to come.</p>
+      <p class="explain">This chart is two days. If yesterday’s midnight freeze is still on disk, the left side is that forecast (pale red and blue) plus the black official outturn. The right side is today’s forecast. If you only see a black line on the left, this box did not keep yesterday’s freeze (first deploy, or it was never issued). Scores in the boxes are for today only; yesterday’s scores are in the CSV link.</p>
       <div class="cards" id="day-cards"></div>
       <button type="button" data-preset="day">Re-issue day</button>
       <div class="chart-wrap half"><canvas id="day"></canvas></div>
@@ -496,18 +496,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       ];
     }
 
-    function drawWindow(id, previousActuals, current, title, mode) {
-      const prev = previousActuals || [];
+    function drawWindow(id, previous, fallbackActuals, current, title, mode, pastLabel) {
+      const issued = (previous && previous.rows) || [];
+      const hasPrevFan = issued.some((row) => row.p50 != null || row.p10 != null);
+      const prev = hasPrevFan ? issued : (fallbackActuals || []);
       const cur = (current && current.rows) || [];
-      const labels = prev.map(r => r.timestamp).concat(cur.map(r => r.timestamp));
-      const right = (value) => prev.map(() => null).concat(cur.map(value));
-      const indo = prev.map(r => r.actual_mw).concat(cur.map(r => r.actual_mw));
-      lineChart(id, labels, [
+      const labels = prev.map((row) => row.timestamp).concat(cur.map((row) => row.timestamp));
+      const left = (key) => prev.map((row) => row[key]).concat(cur.map(() => null));
+      const right = (key) => prev.map(() => null).concat(cur.map((row) => row[key]));
+      const indo = prev.map((row) => row.actual_mw).concat(cur.map((row) => row.actual_mw));
+      const past = pastLabel || "Previous";
+      const datasets = [
         { label: "Actual", data: indo, borderColor: "#111", pointRadius: 0, borderWidth: 2, spanGaps: false },
-        { label: "Low", data: right(r => r.p10), borderColor: "#9bb8d3", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
-        { label: "Most likely", data: right(r => r.p50), borderColor: "#c45c26", pointRadius: 0, borderWidth: 2, spanGaps: false },
-        { label: "High", data: right(r => r.p90), borderColor: "#9bb8d3", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
-      ], title, mode);
+      ];
+      if (hasPrevFan) {
+        datasets.push(
+          { label: past + " low", data: left("p10"), borderColor: "#d5e0ea", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
+          { label: past + " most likely", data: left("p50"), borderColor: "#e0b49a", pointRadius: 0, borderWidth: 2, spanGaps: false },
+          { label: past + " high", data: left("p90"), borderColor: "#d5e0ea", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
+        );
+      }
+      datasets.push(
+        { label: "Low", data: right("p10"), borderColor: "#9bb8d3", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
+        { label: "Most likely", data: right("p50"), borderColor: "#c45c26", pointRadius: 0, borderWidth: 2, spanGaps: false },
+        { label: "High", data: right("p90"), borderColor: "#9bb8d3", pointRadius: 0, borderWidth: 1.5, spanGaps: false },
+      );
+      lineChart(id, labels, datasets, title, mode);
     }
 
     async function load() {
@@ -518,18 +532,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const live = (n30.current && n30.current[0]) || {};
       document.getElementById("week-note").textContent =
         (week.current && week.current.issued_at)
-          ? ("Written " + london(week.current.issued_at) + " · left = last week actual, right = this week’s forecast")
+          ? ("Written " + london(week.current.issued_at)
+            + ((week.previous && week.previous.issued_at)
+              ? " · left = last week’s forecast vs actual"
+              : " · left = last week actual only (no stored last-week freeze)"))
           : "No week forecast yet — it is written Monday midnight UK, or click Issue due presets.";
       document.getElementById("day-note").textContent =
         (day.current && day.current.issued_at)
-          ? ("Written " + london(day.current.issued_at) + " · left = yesterday actual, right = today’s forecast")
+          ? ("Written " + london(day.current.issued_at)
+            + ((day.previous && day.previous.issued_at)
+              ? " · left = yesterday’s forecast vs actual"
+              : " · left = yesterday actual only (no stored yesterday freeze)"))
           : "No day forecast yet — it is written at midnight UK, or click Issue due presets.";
       document.getElementById("n30-note").textContent = live.timestamp
         ? ("Guessing " + london(live.timestamp) + " · written " + london(live.issued_at)
           + " · most likely " + fmt(live.p50) + " MW")
         : "Waiting for the first half-hour guess.";
       cards(document.getElementById("week-cards"), week.current && week.current.metrics);
-      cards(document.getElementById("day-cards"), day.current && day.current.metrics);
+      cards(document.getElementById("day-cards"), day.current && day.current.metrics,
+        (day.previous && day.previous.metrics && day.previous.issued_at)
+          ? `<div class="card" title="Yesterday’s freeze: typical miss once the day had finished."><span class="muted">Yesterday MAE</span><b>${day.previous.metrics.mae != null ? fmt(day.previous.metrics.mae) + " MW" : "—"}</b></div>`
+          : "");
       cards(document.getElementById("n30-cards"), n30.metrics, live.timestamp
         ? `<div class="card" title="When this half-hour guess was written."><span class="muted">Generated</span><b>${london(live.issued_at)}</b></div>
            <div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
@@ -559,8 +582,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <td>${fmt(r.p50)}</td><td>${fmt(r.actual_mw)}</td><td>${mark}</td></tr>`;
           }).join("") + "</tbody>";
       }
-      drawWindow("week", week.previous_actuals, week.current, "Last week’s actual use, then this week’s forecast", "week");
-      drawWindow("day", day.previous_actuals, day.current, "Yesterday’s actual use, then today’s forecast", "day");
+      drawWindow("week", week.previous, week.previous_actuals, week.current, "Last week, then this week’s forecast", "week", "Last week");
+      drawWindow("day", day.previous, day.previous_actuals, day.current, "Yesterday’s forecast vs actual, then today’s forecast", "day", "Yesterday");
       drawNext30(n30.history || [], live);
       drawEval(board.eval || {});
     }

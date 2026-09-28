@@ -20,7 +20,8 @@ def test_dashboard_html():
     assert "three&nbsp;views" in response.text
     assert "Typical size of the miss" in response.text
     assert "This chart is the week ahead" in response.text
-    assert "This chart is today" in response.text
+    assert "Yesterday’s forecast vs actual" in response.text or "yesterday" in response.text.lower()
+    assert "Yesterday forecast CSV" in response.text
     assert "How the guesses did" in response.text
     assert response.text.index('id="next30"') < response.text.index('id="n30-audit"')
     assert "Segoe UI" in response.text
