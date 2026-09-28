@@ -93,3 +93,21 @@ def test_evaluation_tags_outside_band_and_lags():
     assert out["scored"] == 2
     assert out["outside_band"] == 1
     assert out["lags"] == 1
+
+
+def test_width_averages_the_full_issued_fan():
+    import numpy as np
+
+    from energy_forecast.live import preset_metrics
+
+    frame = pd.DataFrame(
+        {
+            "p10": [100.0, 100.0],
+            "p50": [200.0, 200.0],
+            "p90": [400.0, 300.0],
+            "actual_mw": [200.0, np.nan],
+        }
+    )
+    metrics = preset_metrics(frame, compute_wrmsse=False)
+    assert metrics["n"] == 1
+    assert metrics["interval_width"] == 250.0

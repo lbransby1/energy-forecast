@@ -288,7 +288,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <dt>Bias</dt>
     <dd>On average, is the red line too high (positive) or too low (negative), in megawatts.</dd>
     <dt>Width</dt>
-    <dd>How far apart the blue lines are. Wider is a vaguer guess; narrower is more precise but easier to miss.</dd>
+    <dd>Average gap between the two blue lines across the <b>whole issued forecast</b> (including hours that have not finished yet). The week fan is meant to get wider later in the week, so that pulls this number up. MAE and coverage still use only finished half-hours (<b>n</b>).</dd>
   </dl>
   <p>
     <button type="button" id="capture">Issue due presets</button>
@@ -434,7 +434,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="card" title="Compared with copying last week. 1.0 = copy last week. Below 1 is better."><span class="muted">WRMSSE</span><b>${m.wrmsse != null ? Number(m.wrmsse).toFixed(2) : "—"}</b></div>
         <div class="card" title="How often the black line landed between the two blue lines. About 80% is the aim."><span class="muted">Coverage</span><b>${m.coverage_80 != null ? (100*m.coverage_80).toFixed(0) + "%" : "waiting"}</b></div>
         <div class="card" title="On average, is the red line too high (positive) or too low (negative)."><span class="muted">Bias</span><b>${m.bias != null ? fmt(m.bias) + " MW" : "—"}</b></div>
-        <div class="card" title="How far apart the blue lines are, in megawatts."><span class="muted">Width</span><b>${m.interval_width != null ? fmt(m.interval_width) + " MW" : "—"}</b></div>`;
+        <div class="card" title="Average gap between the blue lines over the whole issued forecast, including hours still to come."><span class="muted">Width</span><b>${m.interval_width != null ? fmt(m.interval_width) + " MW" : "—"}</b></div>`;
     }
 
     function lineChart(id, labels, datasets, title, mode) {

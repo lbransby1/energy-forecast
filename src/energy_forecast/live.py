@@ -536,17 +536,21 @@ def preset_metrics(frame: pd.DataFrame, *, compute_wrmsse: bool = True) -> dict:
         "interval_width": None,
         "wrmsse": None,
     }
-    scored = frame.dropna(subset=["actual_mw", "p50"]) if not frame.empty else frame
-    if scored is None or scored.empty:
+    if frame is None or frame.empty:
         return empty
+    width = None
+    if {"p10", "p90"}.issubset(frame.columns):
+        band = (
+            pd.to_numeric(frame["p90"], errors="coerce") - pd.to_numeric(frame["p10"], errors="coerce")
+        ).dropna()
+        if len(band):
+            width = float(band.mean())
+    scored = frame.dropna(subset=["actual_mw", "p50"])
+    if scored is None or scored.empty:
+        return {**empty, "interval_width": width}
     error = scored["actual_mw"] - scored["p50"]
     covered = (
         ((scored["actual_mw"] >= scored["p10"]) & (scored["actual_mw"] <= scored["p90"])).mean()
-        if {"p10", "p90"}.issubset(scored.columns)
-        else np.nan
-    )
-    width = (
-        float((scored["p90"] - scored["p10"]).mean())
         if {"p10", "p90"}.issubset(scored.columns)
         else np.nan
     )
@@ -556,7 +560,7 @@ def preset_metrics(frame: pd.DataFrame, *, compute_wrmsse: bool = True) -> dict:
         "rmse": float(np.sqrt(np.mean(error.to_numpy() ** 2))),
         "bias": float(error.mean()),
         "coverage_80": float(covered) if pd.notna(covered) else None,
-        "interval_width": width if pd.notna(width) else None,
+        "interval_width": width,
         "wrmsse": None,
     }
     if not compute_wrmsse:
