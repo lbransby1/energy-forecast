@@ -1,12 +1,12 @@
 # Technical abilities — GB National Demand quantile forecast
 
-This note is for recruiters and hiring managers. It describes the skills used to design, train, evaluate, and operate a live electricity-demand forecasting system — not a toy notebook. The product is a **P10 / P50 / P90** forecast of Great Britain National Demand, scored against **Elexon Insights INDO** after each half-hour settlement period.
+The product is a **P10 / P50 / P90** forecast of Great Britain National Demand, scored against **Elexon Insights INDO** after each half-hour settlement period.
 
 Stack in one line: **Python 3.11, pandas, LightGBM, Optuna, SHAP, FastAPI, Parquet, Docker**, plus public energy and weather APIs.
 
 ---
 
-## What was built (the interview story)
+## What was built 
 
 National Demand is a half-hourly GB series (NESO `ND` historically, INDO live). The system produces three live products from separate model packs:
 
@@ -51,14 +51,14 @@ Domain constraint that shaped the engineering: **no GSP / regional models**. The
 - Auth: optional `LIVE_TOKEN` (Bearer) on mutating routes; **password gate on re-issuing the week freeze** so a passer-by cannot reset a running trial (`hmac.compare_digest`, secret from env or gitignored file).
 - **Docker** image (`python:3.11-slim`) and Compose with a live-data volume so scores survive restarts.
 
-### Frontend / UX engineering (enough to ship)
+### Frontend / UX engineering
 
 - Single-page dashboard: three presets, London-time axis ticks, previous-window INDO in grey then the live fan, next-30 **issued history vs live dots**, input-health line, stale-lag audit table.
 - ISO-8601 `Z` timestamps so the browser does not parse `+0000` as local and shift the live point by an hour.
 
 ### Production debugging
 
-Lived issues that required SWE, not more trees:
+Lived issues that required SWE:
 
 - Stale INDO cache treated a morning snapshot as “today complete” → hour model followed overnight demand through the Monday ramp.
 - Hourly fallback copied 12:00 INDO onto 12:30 when settlement period was present.
@@ -76,7 +76,7 @@ Lived issues that required SWE, not more trees:
 - **Horizon-specific packs**: short lags (`demand_lag_1`, `demand_lag_2`) are valid for the next hour and leak or sit empty for day 7. Separate hour / day / week models, routed live by `lead_hours`.
 - Train/serve weather **matched by product**: hour pack on ERA5 (nowcast-like); day/week on Previous Runs so holdout weather is the forecast that would have been available at issue, not perfect ERA5.
 
-### Features (causal, not kitchen-sink)
+### Features
 
 - Calendar: hour, settlement period, weekend, UK bank holidays (`holidays` + GB subdiv), Fourier terms.
 - Weather: temperature, humidity, wind, shortwave, cloud, rain; **HDD/CDD vs 15.5 °C**.
@@ -105,15 +105,13 @@ Lived issues that required SWE, not more trees:
 - Saved artefacts: boosters, climatology parquet, metadata (features, interval scale, role).
 - Three on-disk packs (`data/models`, `.../day`, `.../hour`) loaded independently; live routing concatenates by lead mask.
 
-### Failure analysis as part of the model, not a slide
+### Failure analysis as part of the model
 
 Case-study notebook: holiday, **working Tuesday after a holiday** (the real miss), clock-change, hot weekday, median weekday. Quantified: 1 Sep 2026 day-after MAE **1,225 MW** vs **715 MW** median weekday. That is how you talk about lag-based models in energy: persistence is the feature and the bug.
 
 ---
 
-## Applied AI / AI engineering (AIE)
-
-This is **not** an LLM or RAG app. It is applied AI in the sense hiring teams mean when they want “models that run, get explained, and get scored in production.”
+## Applied AI / AI engineering
 
 ### Serve, freeze, score
 
@@ -123,7 +121,7 @@ This is **not** an LLM or RAG app. It is applied AI in the sense hiring teams me
 
 ### Explainability
 
-- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails.
+- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails. (not available on online demo as of 28/9/26, is in notebook)
 - Explanations routed by which pack scored that row (hour vs day vs week).
 
 ### Evaluation culture
@@ -148,18 +146,8 @@ This is **not** an LLM or RAG app. It is applied AI in the sense hiring teams me
 
 ---
 
-## Product and energy-domain literacy
 
-Recruiters in climate / energy / trading care that the author knows:
-
-- INDO vs NESO ND, settlement periods, London DST.
-- Why **Previous Runs** is the right weather for a day-ahead backtest and ERA5 is not.
-- Why a 30-minute model is a lag-follower and a 7-day model is weekly shape plus weather on the floor, not the evening peak.
-- Why regional GSP was refused: **no live label**.
-
----
-
-## Skills checklist (scan-friendly)
+## Skills checklist
 
 | Area | Evidence in this repo |
 |---|---|
@@ -176,16 +164,5 @@ Recruiters in climate / energy / trading care that the author knows:
 | Metrics design | WRMSSE vs weekly naive, skill vs climatology, MAE at display freq |
 | Scientific honesty | reverted holiday features; documented the miss they did not fix |
 
----
 
-## One paragraph for a CV
 
-Built and operate a live GB electricity **quantile** forecast (P10/P50/P90) from public NESO/Elexon demand and Open-Meteo weather. Three LightGBM packs (next 30 minutes, next day, next week) with leakage-aware weather (ERA5 vs Previous Runs), Optuna, SHAP, and holdout plus **issue-then-score against INDO**. FastAPI dashboard, Docker, frozen feature snapshots, and production fixes for timezone, stale caches, and concurrent Parquet writes.
-
----
-
-## Talking points if they ask “what would you do next?”
-
-- Recalibrate the hour-model interval: residual quantiles given lags are ~0.9 GW wide and under-cover when the mean is late on a ramp.
-- Do not pretend calendar flags beat a wrong `lag_48` after a holiday; try a holiday-aware lag or a separate post-holiday model.
-- Keep live scoring as the source of truth; holdout will not catch a morning INDO cache bug.
