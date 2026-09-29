@@ -49,12 +49,15 @@ def test_board_payload_does_not_call_insights(monkeypatch):
     assert payload["eval"]["scored"] == 0
 
 
-def test_week_previous_is_last_calendar_week(monkeypatch):
+def test_week_previous_is_last_two_days(monkeypatch):
+    from energy_forecast.live import week_previous_chart_start
+
     this_monday = pd.Timestamp("2026-09-27T23:00:00Z")
     last_monday = pd.Timestamp("2026-09-20T23:00:00Z")
     overlap = pd.date_range("2026-09-27T21:00:00Z", periods=12, freq="30min", tz="UTC")
     current = pd.date_range(this_monday, periods=6, freq="30min", tz="UTC")
-    last_week = pd.date_range("2026-09-21T12:00:00Z", periods=4, freq="30min", tz="UTC")
+    saturday = pd.date_range("2026-09-26T12:00:00Z", periods=4, freq="30min", tz="UTC")
+    monday_last_week = pd.date_range("2026-09-21T12:00:00Z", periods=4, freq="30min", tz="UTC")
     board = pd.DataFrame(
         {
             "preset": ["week"] * (len(overlap) + len(current)),
@@ -67,7 +70,12 @@ def test_week_previous_is_last_calendar_week(monkeypatch):
             "p90": [11000.0] * (len(overlap) + len(current)),
         }
     )
-    context = pd.DataFrame({"timestamp": last_week, "actual_mw": [24000.0] * len(last_week)})
+    context = pd.DataFrame(
+        {
+            "timestamp": list(saturday) + list(monday_last_week),
+            "actual_mw": [24000.0] * len(saturday) + [23000.0] * len(monday_last_week),
+        }
+    )
     monkeypatch.setattr("energy_forecast.live.load_board", lambda: board)
     monkeypatch.setattr("energy_forecast.live.load_context_actuals", lambda: context)
     monkeypatch.setattr(
@@ -78,12 +86,14 @@ def test_week_previous_is_last_calendar_week(monkeypatch):
     payload = board_payload(refresh=False)
     prev_ts = [pd.Timestamp(row["timestamp"]) for row in payload["week"]["previous"]["rows"]]
     cur_ts = [pd.Timestamp(row["timestamp"]) for row in payload["week"]["current"]["rows"]]
+    lookback = week_previous_chart_start(pd.Timestamp("2026-09-29T10:00:00", tz="Europe/London"))
     assert prev_ts
+    assert min(prev_ts) >= lookback
     assert max(prev_ts) < this_monday
     assert min(cur_ts) >= this_monday
     assert 20000.0 in [row["p50"] for row in payload["week"]["current"]["rows"]]
     assert 24000.0 in [row["actual_mw"] for row in payload["week"]["previous_actuals"]]
-    assert len(payload["week"]["previous_actuals"]) == len(last_week)
+    assert 23000.0 not in [row["actual_mw"] for row in payload["week"]["previous_actuals"]]
     labels = prev_ts + cur_ts
     assert labels == sorted(labels)
 
@@ -92,7 +102,7 @@ def test_board_uses_context_indo_without_prior_freeze(monkeypatch):
     context = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(
-                ["2026-09-27T12:00:00Z", "2026-09-21T12:00:00Z", "2026-09-28T10:00:00Z"]
+                ["2026-09-27T12:00:00Z", "2026-09-26T12:00:00Z", "2026-09-28T10:00:00Z"]
             ),
             "actual_mw": [25000.0, 24000.0, 26000.0],
         }

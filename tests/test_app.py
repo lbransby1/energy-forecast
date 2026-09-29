@@ -19,7 +19,7 @@ def test_dashboard_html():
     assert "Grid Demand UK" in response.text
     assert "three&nbsp;views" in response.text
     assert "Typical size of the miss" in response.text
-    assert "This chart is last week then this week" in response.text
+    assert "This chart is the last two days of last week" in response.text
     assert "Yesterday’s forecast vs actual" in response.text or "yesterday" in response.text.lower()
     assert "Yesterday forecast CSV" in response.text
     assert "How the guesses did" in response.text
@@ -30,6 +30,8 @@ def test_dashboard_html():
     assert 'id="reload"' in response.text
     assert "setInterval(load" not in response.text
     assert "waitForIndo" not in response.text
+    assert '["03", "06", "09", "12", "15", "18", "21"]' in response.text
+    assert 'return `${p.hour}:30`' not in response.text
 
 
 def test_chart_js_is_local():

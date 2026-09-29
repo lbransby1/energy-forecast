@@ -328,7 +328,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <a href="/download/week/frozen?which=previous">Previous inputs</a>
       </div>
     </div>
-    <p class="explain">This chart is last week then this week, in calendar order from last Monday. The complete-midnight-day rule is only for the day and next-30 charts. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Scores in the boxes only use hours of this week that already have a black line.</p>
+    <p class="explain">This chart is the last two days of last week (Saturday and Sunday), then this week from Monday, in time order. That keeps this week’s half-hours readable. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Scores in the boxes only use hours of this week that already have a black line.</p>
     <div class="cards" id="week-cards"></div>
     <button type="button" data-preset="week">Re-issue week (password)</button>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
@@ -462,8 +462,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return "";
       }
       if (mode === "next30") {
-        if (p.minute === "00") return p.hour === "00" ? `${p.day} ${p.month}` : `${p.hour}:00`;
-        if (p.minute === "30") return `${p.hour}:30`;
+        if (p.hour === "00" && p.minute === "00") return `${p.day} ${p.month}`;
+        if (p.minute === "00" && ["03", "06", "09", "12", "15", "18", "21"].includes(p.hour)) return `${p.hour}:00`;
         return "";
       }
       if (p.minute === "00") {
@@ -614,8 +614,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         (week.current && week.current.issued_at)
           ? ("Written " + london(week.current.issued_at)
             + ((week.previous && week.previous.issued_at)
-              ? " · left = last week’s forecast vs actual"
-              : " · left = last week actual only (no stored last-week freeze)"))
+              ? " · left = Saturday–Sunday vs actual"
+              : " · left = Saturday–Sunday actual only"))
           : "No week forecast yet — it is written Monday midnight UK, or click Issue due presets.";
       const yestFan = day.previous && day.previous.issued_at;
       const yestActuals = day.previous_actuals && day.previous_actuals.length;
@@ -669,7 +669,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <td>${fmt(r.p50)}</td><td>${fmt(r.actual_mw)}</td><td>${mark}</td></tr>`;
           }).join("") + "</tbody>";
       }
-      drawWindow("week", week.previous, week.previous_actuals, week.current, "Last week, then this week’s forecast", "week", "Last week", stampMs(week.current && week.current.window_start));
+      drawWindow("week", week.previous, week.previous_actuals, week.current, "Saturday–Sunday, then this week’s forecast", "week", "Sat–Sun", stampMs(week.current && week.current.window_start));
       drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
       drawNext30(n30.history || [], live);
       drawEval(board.eval || {});

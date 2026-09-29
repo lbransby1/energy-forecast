@@ -255,6 +255,12 @@ def previous_week_window(when: pd.Timestamp | None = None) -> pd.Timestamp:
     return week_window(when) - pd.Timedelta(days=7)
 
 
+def week_previous_chart_start(when: pd.Timestamp | None = None) -> pd.Timestamp:
+    """Saturday 00:00 Europe/London of the week just ended (last two days before this Monday)."""
+    monday = week_window(when).tz_convert(LONDON_TZ)
+    return (monday - pd.Timedelta(days=2)).normalize().tz_convert("UTC")
+
+
 def _as_utc(stamp: pd.Timestamp) -> pd.Timestamp:
     out = pd.Timestamp(stamp)
     return out.tz_convert("UTC") if out.tzinfo else out.tz_localize("UTC")
@@ -953,7 +959,7 @@ def _previous_actuals(
         keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in chunk.columns]
         return _frame_records(chunk.loc[:, keep].dropna(subset=["actual_mw"]))
     end = week_window(now)
-    start = previous_week_window(now)
+    start = week_previous_chart_start(now)
     chunk = _slice_actuals(ctx, start, end)
     if chunk.empty:
         rows = _overlay_actuals(_span_rows(WEEK, start, end, board), ctx)
@@ -1115,6 +1121,7 @@ def board_payload(*, refresh: bool = False) -> dict:
     t_start, t_end, _ = london_day_range(today)
     this_monday = week_window(now)
     last_monday = previous_week_window(now)
+    week_left = week_previous_chart_start(now)
     next_monday = this_monday + pd.Timedelta(days=7)
     payload = {
         "as_of": now.isoformat(),
@@ -1161,7 +1168,7 @@ def board_payload(*, refresh: bool = False) -> dict:
                 board,
                 context=context,
                 rows=_pad_actual_slots(
-                    _span_rows(WEEK, last_monday, this_monday, board), context, last_monday, this_monday
+                    _span_rows(WEEK, week_left, this_monday, board), context, week_left, this_monday
                 ),
             ),
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
