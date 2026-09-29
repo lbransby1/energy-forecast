@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 
@@ -195,18 +197,70 @@ def test_week_actuals_cover_hours_before_a_late_freeze(monkeypatch):
     assert 20000.0 in [row["p50"] for row in cur if row.get("p50") is not None]
 
 
-def test_align_next30_plots_old_guess_on_the_current_half_hour():
-    from energy_forecast.live import _align_next30_target
+def test_next30_actuals_sit_at_period_end(monkeypatch):
+    from energy_forecast.live import _overlay_next30_actuals, _window_payload
 
-    frame = pd.DataFrame(
+    guess = pd.DataFrame(
         {
-            "timestamp": pd.to_datetime(["2026-09-29T08:30:00Z"]),
-            "issued_at": pd.to_datetime(["2026-09-29T08:00:00Z"]),
+            "timestamp": pd.to_datetime(["2026-09-29T12:30:00Z"]),
             "p50": [20000.0],
+            "actual_mw": [99999.0],
         }
     )
-    out = _align_next30_target(frame)
-    assert pd.Timestamp(out["timestamp"].iloc[0]) == pd.Timestamp("2026-09-29T08:00:00Z")
+    context = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-09-29T12:00:00Z"]),
+            "actual_mw": [25000.0],
+        }
+    )
+    out = _overlay_next30_actuals(guess, context)
+    assert float(out["actual_mw"].iloc[0]) == 25000.0
+
+    window = pd.Timestamp("2026-09-29T12:00:00Z")
+    board = pd.DataFrame(
+        {
+            "preset": ["next30"],
+            "window_start": [window],
+            "timestamp": pd.to_datetime(["2026-09-29T12:30:00Z"]),
+            "p10": [19000.0],
+            "p50": [20000.0],
+            "p90": [21000.0],
+            "actual_mw": [99999.0],
+        }
+    )
+    payload = _window_payload("next30", window, board, context=context)
+    assert payload["rows"][0]["actual_mw"] == 25000.0
+
+
+def test_reset_next30_scores_leaves_day_rows(tmp_path, monkeypatch):
+    from energy_forecast.live import apply_next30_stats_epoch, load_board, reset_next30_scores, save_board
+
+    monkeypatch.setattr("energy_forecast.paths.DATA_LIVE", tmp_path)
+    monkeypatch.setattr("energy_forecast.live.DATA_LIVE", tmp_path)
+    (tmp_path / "frozen").mkdir(parents=True, exist_ok=True)
+    board = pd.DataFrame(
+        {
+            "preset": ["next30", "day"],
+            "window_start": pd.to_datetime(["2026-09-29T10:00:00Z", "2026-09-28T23:00:00Z"]),
+            "timestamp": pd.to_datetime(["2026-09-29T10:30:00Z", "2026-09-29T00:00:00Z"]),
+            "p50": [20000.0, 21000.0],
+            "actual_mw": [20100.0, 21100.0],
+        }
+    )
+    save_board(board)
+    (tmp_path / "frozen" / "next30_20260929T1000.parquet").write_bytes(b"x")
+    (tmp_path / "wrmsse_cache.json").write_text('{"next30": 0.4, "next30_n": 139, "day": 0.2}', encoding="utf-8")
+    out = reset_next30_scores()
+    kept = load_board()
+    assert out["dropped"] == 1
+    assert list(kept["preset"]) == ["day"]
+    assert not (tmp_path / "frozen" / "next30_20260929T1000.parquet").exists()
+    cache = json.loads((tmp_path / "wrmsse_cache.json").read_text(encoding="utf-8"))
+    assert "next30" not in cache
+    assert cache["day"] == 0.2
+    monkeypatch.setenv("RESET_NEXT30_SCORES", "1")
+    again = apply_next30_stats_epoch()
+    assert again.get("skipped") is True
 
 
 def test_complete_midnight_day_needs_every_half_hour():

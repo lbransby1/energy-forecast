@@ -58,6 +58,9 @@ async def lifespan(_app: FastAPI):
     if os.environ.get("EF_SKIP_CAPTURE") == "1":
         yield
         return
+    from energy_forecast.live import apply_next30_stats_epoch
+
+    apply_next30_stats_epoch()
     task = asyncio.create_task(_capture_loop())
     yield
     task.cancel()
@@ -376,7 +379,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/inputs/next30">Input check JSON</a>
         </div>
       </div>
-      <p class="explain">This chart is today from midnight, one guess per half-hour. Yesterday is included only after that calendar day is a complete midnight-to-midnight set of official outturn. Pale red is what was written at the time. Dots are the live guess still waiting. Black appears once the official number is published.</p>
+      <p class="explain">This chart is today from midnight, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Yesterday is included only after that calendar day is a complete midnight-to-midnight set of official outturn. Pale red is what was written at the time. Dots are the live guess still waiting.</p>
       <div class="cards" id="n30-cards"></div>
       <button type="button" data-preset="next30">Re-issue next 30</button>
       <div class="chart-wrap half"><canvas id="next30"></canvas></div>
@@ -384,7 +387,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <dt>Generated</dt>
         <dd>When this half-hour guess was written.</dd>
         <dt>Target</dt>
-        <dd>Which half-hour the guess is for (the start of that period).</dd>
+        <dd>The end of the half-hour being guessed. 1:30 means 1:00–1:30, matching the black line.</dd>
         <dt>Live P50</dt>
         <dd>The current red-line guess, in megawatts, for that target half-hour.</dd>
       </dl>

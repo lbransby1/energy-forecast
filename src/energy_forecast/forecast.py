@@ -230,6 +230,9 @@ def run_pack(
 
     Day and week packs score ``origin`` plus ``horizon_hours`` (Monday / midnight),
     not “from now”, so a late re-issue still covers that calendar window.
+
+    The hour pack scores the current settlement period (1:00 = 1:00–1:30) and
+    writes the guess at the period end (1:30) so it lines up with official outturn.
     """
     if role not in {"hour", "day", "week"}:
         raise ValueError("role must be 'hour', 'day', or 'week'")
@@ -254,7 +257,12 @@ def run_pack(
     stamps = pd.to_datetime(featured["timestamp"], utc=True)
     scored = featured.loc[(stamps >= start) & (stamps < start + horizon)].copy()
     if role == "hour":
-        target = now.tz_convert("UTC") if now.tzinfo else now.tz_localize("UTC")
+        # Current SP start (1:00 = 1:00–1:30). The board later labels that guess at 1:30.
+        target = now
+        if target.tzinfo is None:
+            target = target.tz_localize("UTC")
+        else:
+            target = target.tz_convert("UTC")
         scored_ts = pd.to_datetime(scored["timestamp"], utc=True)
         one = scored.loc[scored_ts == target]
         scored = one if not one.empty else scored.head(1)
@@ -278,6 +286,9 @@ def run_pack(
     predicted["last_indo_timestamp"] = last_indo_ts
     predicted["last_indo_mw"] = last_indo_mw
     predicted = attach_indo_actuals(predicted)
+    if role == "hour":
+        predicted = predicted.copy()
+        predicted["timestamp"] = pd.to_datetime(predicted["timestamp"], utc=True) + pd.Timedelta(minutes=30)
     keep = [column for column in FORECAST_COLUMNS if column in predicted.columns]
     forecast = predicted.loc[:, keep].sort_values("timestamp").reset_index(drop=True)
     frozen_wanted = list(_FROZEN_COLUMNS)
@@ -371,6 +382,17 @@ def attach_indo_actuals(frame: pd.DataFrame) -> pd.DataFrame:
 
     exact = indo.loc[:, ["timestamp", "demand_mw"]].rename(columns={"demand_mw": "actual_mw"})
     merged = out.drop(columns=["actual_mw"], errors="ignore").merge(exact, on="timestamp", how="left")
+    if "preset" in merged.columns:
+        n30 = merged["preset"].astype(str) == "next30"
+        if n30.any():
+            shifted = exact.copy()
+            shifted["timestamp"] = pd.to_datetime(shifted["timestamp"], utc=True) + pd.Timedelta(minutes=30)
+            lookup = (
+                shifted.dropna(subset=["actual_mw"])
+                .drop_duplicates("timestamp")
+                .set_index("timestamp")["actual_mw"]
+            )
+            merged.loc[n30, "actual_mw"] = merged.loc[n30, "timestamp"].map(lookup)
     half_hourly = (
         "settlement_period" in merged.columns
         and merged["settlement_period"].notna().any()

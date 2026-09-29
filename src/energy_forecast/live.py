@@ -179,17 +179,30 @@ def _pad_actual_slots(
     return combined.sort_values("timestamp")
 
 
-def _align_next30_target(frame: pd.DataFrame) -> pd.DataFrame:
-    """Old hour packs targeted the following SP (issued_at + 30min). Plot that guess on the current SP."""
-    if frame is None or frame.empty or "timestamp" not in frame.columns:
-        return frame
-    out = frame.copy()
+def _indo_at_period_end(context: pd.DataFrame) -> pd.DataFrame:
+    """INDO is stored at period start (1:00 = 1:00–1:30). The hour pack targets 1:30."""
+    if context is None or context.empty or "timestamp" not in context.columns:
+        return context if context is not None else pd.DataFrame()
+    out = context.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True) + pd.Timedelta(minutes=30)
+    return out
+
+
+def _overlay_next30_actuals(rows: pd.DataFrame, context: pd.DataFrame) -> pd.DataFrame:
+    """Join 1:00–1:30 outturn onto the 1:30 guess, overwriting same-timestamp INDO."""
+    if rows is None or rows.empty:
+        return rows
+    shifted = _indo_at_period_end(context)
+    if shifted is None or shifted.empty:
+        return rows
+    out = rows.copy()
     out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
-    if "issued_at" not in out.columns:
-        return out
-    issued = pd.to_datetime(out["issued_at"], utc=True)
-    shifted = (out["timestamp"] - issued) == pd.Timedelta(minutes=30)
-    out.loc[shifted, "timestamp"] = issued.loc[shifted]
+    lookup = (
+        shifted.dropna(subset=["actual_mw"])
+        .drop_duplicates("timestamp")
+        .set_index("timestamp")["actual_mw"]
+    )
+    out["actual_mw"] = out["timestamp"].map(lookup)
     return out
 
 
@@ -231,8 +244,61 @@ def load_board() -> pd.DataFrame:
 
 def save_board(frame: pd.DataFrame) -> None:
     keep = [column for column in KEEP if column in frame.columns]
-    out = frame.loc[:, keep].sort_values(["preset", "window_start", "timestamp"]).reset_index(drop=True)
-    out.to_parquet(board_path(), index=False)
+    out = frame.loc[:, keep] if keep else frame
+    sort = [column for column in ("preset", "window_start", "timestamp") if column in out.columns]
+    if sort and not out.empty:
+        out = out.sort_values(sort)
+    out.reset_index(drop=True).to_parquet(board_path(), index=False)
+
+
+NEXT30_STATS_EPOCH = "2"
+
+
+def _next30_epoch_path():
+    ensure_data_dirs()
+    return DATA_LIVE / "next30_stats_epoch.txt"
+
+
+def _next30_epoch_matches() -> bool:
+    path = _next30_epoch_path()
+    if not path.exists():
+        return False
+    try:
+        return path.read_text(encoding="utf-8").strip() == NEXT30_STATS_EPOCH
+    except OSError:
+        return False
+
+
+def reset_next30_scores() -> dict:
+    """Drop next-30 board rows, frozen snapshots, and WRMSSE so n starts at zero."""
+    with _TICK_LOCK:
+        board = load_board()
+        dropped = 0
+        if not board.empty and "preset" in board.columns:
+            dropped = int((board["preset"] == NEXT30).sum())
+            board = board.loc[board["preset"] != NEXT30]
+        save_board(board)
+        frozen_removed = 0
+        for path in frozen_dir().glob("next30_*.parquet"):
+            path.unlink(missing_ok=True)
+            frozen_removed += 1
+        cache = load_wrmsse_cache()
+        if cache:
+            cache.pop(NEXT30, None)
+            cache.pop(f"{NEXT30}_n", None)
+            _wrmsse_cache_path().write_text(json.dumps(cache), encoding="utf-8")
+        _next30_epoch_path().write_text(NEXT30_STATS_EPOCH, encoding="utf-8")
+        _BOARD_CACHE["payload"] = None
+        return {"dropped": dropped, "frozen_removed": frozen_removed, "epoch": NEXT30_STATS_EPOCH}
+
+
+def apply_next30_stats_epoch() -> dict:
+    """One-shot wipe of next-30 scores on Railway after the period-end timing fix."""
+    if os.environ.get("RESET_NEXT30_SCORES") != "1" and not os.environ.get("RAILWAY_ENVIRONMENT"):
+        return {"skipped": True, "reason": "not railway"}
+    if _next30_epoch_matches():
+        return {"skipped": True, "reason": "already applied"}
+    return reset_next30_scores()
 
 
 def london_now() -> pd.Timestamp:
@@ -489,6 +555,8 @@ def _capture_preset(preset: str, *, force: bool = False, week_password: str | No
 
 def import_legacy_next30() -> int:
     """Copy the old hourly-archive shorts onto the next-30 board (once per timestamp)."""
+    if _next30_epoch_matches():
+        return 0
     legacy = scored_frame()
     if legacy.empty or "mode" not in legacy.columns:
         return 0
@@ -576,8 +644,11 @@ def refresh_wrmsse_cache() -> dict:
     if not np.isfinite(scale) or scale <= 0:
         return load_wrmsse_cache()
     board = load_board()
+    context = load_context_actuals()
     for preset in PRESETS:
         rows = _preset_frame(preset, board)
+        if preset == NEXT30:
+            rows = _overlay_next30_actuals(rows, context)
         metrics = preset_metrics(rows, compute_wrmsse=False)
         scored = rows.dropna(subset=["actual_mw", "p50"]) if not rows.empty else rows
         wrmsse = None
@@ -920,7 +991,10 @@ def _window_payload(
     if not rows.empty:
         rows = rows.sort_values("timestamp")
     if context is not None:
-        rows = _overlay_actuals(rows, context)
+        if preset == NEXT30:
+            rows = _overlay_next30_actuals(rows, context)
+        else:
+            rows = _overlay_actuals(rows, context)
     needed = [column for column in ("actual_mw", "p50") if column in rows.columns]
     scored = rows.dropna(subset=needed) if not rows.empty and needed else rows
     metrics = preset_metrics(rows, compute_wrmsse=False)
@@ -990,9 +1064,9 @@ def _next30_history(
         if not live30.empty:
             cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True)
             history = history.loc[pd.to_datetime(history["timestamp"], utc=True) <= cap]
-    history = _overlay_actuals(history, context)
+    history = _overlay_next30_actuals(history, context)
     cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True) if not live30.empty else now_utc
-    trail = _slice_actuals(context, cutoff, cap + pd.Timedelta(seconds=1))
+    trail = _slice_actuals(_indo_at_period_end(context), cutoff, cap + pd.Timedelta(seconds=1))
     if trail.empty:
         return history.sort_values("timestamp") if not history.empty else history
     have = (
@@ -1021,7 +1095,11 @@ def evaluation_payload(
     lags = 0
     large = 0
     for preset in PRESETS:
-        frame = _overlay_actuals(_preset_frame(preset, board), context)
+        frame = _preset_frame(preset, board)
+        if preset == NEXT30:
+            frame = _overlay_next30_actuals(frame, context)
+        else:
+            frame = _overlay_actuals(frame, context)
         if frame.empty or "p50" not in frame.columns or "actual_mw" not in frame.columns:
             continue
         work = frame.dropna(subset=["actual_mw", "p50"]).copy()
@@ -1100,19 +1178,19 @@ def board_payload(*, refresh: bool = False) -> dict:
     next30 = _preset_frame(NEXT30, board).copy()
     if not next30.empty:
         next30["timestamp"] = pd.to_datetime(next30["timestamp"], utc=True)
-        next30 = _align_next30_target(next30)
         next30 = next30.sort_values("timestamp")
+    scored30 = _overlay_next30_actuals(next30, context)
     live30 = next30.iloc[0:0]
-    if not next30.empty:
-        waiting = next30
-        if "actual_mw" in next30.columns:
-            waiting = next30.loc[next30["actual_mw"].isna()].sort_values("timestamp")
-        live30 = waiting.iloc[:1] if not waiting.empty else next30.iloc[-1:]
+    if not scored30.empty:
+        waiting = scored30
+        if "actual_mw" in scored30.columns:
+            waiting = scored30.loc[scored30["actual_mw"].isna()].sort_values("timestamp")
+        live30 = waiting.iloc[:1] if not waiting.empty else scored30.iloc[-1:]
     day_windows = _windows(DAY, board)
     week_windows = _windows(WEEK, board)
     history30 = _next30_history(next30, live30, now_utc, context)
     live_window = live30["window_start"].iloc[0] if not live30.empty else None
-    n30_metrics = preset_metrics(_overlay_actuals(next30, context), compute_wrmsse=False)
+    n30_metrics = preset_metrics(_overlay_next30_actuals(next30, context), compute_wrmsse=False)
     n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
     audit = next30_input_audit(next30, use_network=False)
     yesterday = previous_london_midnight(now)
