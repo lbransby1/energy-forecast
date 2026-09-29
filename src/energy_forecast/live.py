@@ -151,6 +151,48 @@ def _overlay_actuals(rows: pd.DataFrame, context: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _pad_actual_slots(
+    rows: pd.DataFrame,
+    context: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Keep the black INDO line continuous even when a freeze starts late (e.g. 9am)."""
+    trail = _slice_actuals(context, start, end) if context is not None else pd.DataFrame()
+    work = rows.copy() if rows is not None and not rows.empty else pd.DataFrame()
+    if work.empty and trail.empty:
+        return work
+    if not work.empty:
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+        work = _overlay_actuals(work, context) if context is not None else work
+    if trail.empty:
+        return work.sort_values("timestamp") if not work.empty else work
+    trail = trail.copy()
+    trail["timestamp"] = pd.to_datetime(trail["timestamp"], utc=True)
+    have = set(work["timestamp"]) if not work.empty and "timestamp" in work.columns else set()
+    extra = trail.loc[~trail["timestamp"].isin(have)].copy()
+    if extra.empty:
+        return work.sort_values("timestamp") if not work.empty else work
+    for column in ("p10", "p50", "p90"):
+        extra[column] = np.nan
+    combined = extra if work.empty else pd.concat([work, extra], ignore_index=True)
+    return combined.sort_values("timestamp")
+
+
+def _align_next30_target(frame: pd.DataFrame) -> pd.DataFrame:
+    """Old hour packs targeted the following SP (issued_at + 30min). Plot that guess on the current SP."""
+    if frame is None or frame.empty or "timestamp" not in frame.columns:
+        return frame
+    out = frame.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    if "issued_at" not in out.columns:
+        return out
+    issued = pd.to_datetime(out["issued_at"], utc=True)
+    shifted = (out["timestamp"] - issued) == pd.Timedelta(minutes=30)
+    out.loc[shifted, "timestamp"] = issued.loc[shifted]
+    return out
+
+
 def frozen_dir():
     ensure_data_dirs()
     path = DATA_LIVE / "frozen"
@@ -1052,6 +1094,7 @@ def board_payload(*, refresh: bool = False) -> dict:
     next30 = _preset_frame(NEXT30, board).copy()
     if not next30.empty:
         next30["timestamp"] = pd.to_datetime(next30["timestamp"], utc=True)
+        next30 = _align_next30_target(next30)
         next30 = next30.sort_values("timestamp")
     live30 = next30.iloc[0:0]
     if not next30.empty:
@@ -1090,14 +1133,14 @@ def board_payload(*, refresh: bool = False) -> dict:
                 board,
                 wrmsse=wrmsse.get(DAY),
                 context=context,
-                rows=_span_rows(DAY, t_start, t_end, board),
+                rows=_pad_actual_slots(_span_rows(DAY, t_start, t_end, board), context, t_start, t_end),
             ),
             "previous": _window_payload(
                 DAY,
                 yesterday,
                 board,
                 context=context,
-                rows=_span_rows(DAY, y_start, y_end, board),
+                rows=_pad_actual_slots(_span_rows(DAY, y_start, y_end, board), context, y_start, y_end),
             ),
             "previous_actuals": _previous_actuals(DAY, day_windows, board, context),
         },
@@ -1108,14 +1151,18 @@ def board_payload(*, refresh: bool = False) -> dict:
                 board,
                 wrmsse=wrmsse.get(WEEK),
                 context=context,
-                rows=_span_rows(WEEK, this_monday, next_monday, board),
+                rows=_pad_actual_slots(
+                    _span_rows(WEEK, this_monday, next_monday, board), context, this_monday, next_monday
+                ),
             ),
             "previous": _window_payload(
                 WEEK,
                 last_monday,
                 board,
                 context=context,
-                rows=_span_rows(WEEK, last_monday, this_monday, board),
+                rows=_pad_actual_slots(
+                    _span_rows(WEEK, last_monday, this_monday, board), context, last_monday, this_monday
+                ),
             ),
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
         },

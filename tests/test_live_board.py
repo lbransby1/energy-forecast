@@ -148,6 +148,57 @@ def test_day_late_freeze_stops_at_midnight(monkeypatch):
     assert pd.Timestamp(payload["day"]["boundary"]) == today
 
 
+def test_week_actuals_cover_hours_before_a_late_freeze(monkeypatch):
+    this_monday = pd.Timestamp("2026-09-27T23:00:00Z")
+    late = pd.date_range("2026-09-28T08:00:00Z", periods=4, freq="30min", tz="UTC")
+    overnight = pd.date_range(this_monday, periods=4, freq="30min", tz="UTC")
+    board = pd.DataFrame(
+        {
+            "preset": ["week"] * len(late),
+            "window_start": [this_monday] * len(late),
+            "timestamp": list(late),
+            "issued_at": [this_monday] * len(late),
+            "p10": [19000.0] * len(late),
+            "p50": [20000.0] * len(late),
+            "p90": [21000.0] * len(late),
+            "actual_mw": [None] * len(late),
+        }
+    )
+    context = pd.DataFrame(
+        {
+            "timestamp": list(overnight) + list(late),
+            "actual_mw": [24000.0] * len(overnight) + [25000.0] * len(late),
+        }
+    )
+    monkeypatch.setattr("energy_forecast.live.load_board", lambda: board)
+    monkeypatch.setattr("energy_forecast.live.load_context_actuals", lambda: context)
+    monkeypatch.setattr(
+        "energy_forecast.live.london_now",
+        lambda: pd.Timestamp("2026-09-29T12:00:00", tz="Europe/London"),
+    )
+    _BOARD_CACHE["payload"] = None
+    payload = board_payload(refresh=False)
+    cur = payload["week"]["current"]["rows"]
+    stamps = [pd.Timestamp(row["timestamp"]) for row in cur]
+    assert overnight[0] in stamps
+    assert 24000.0 in [row["actual_mw"] for row in cur]
+    assert 20000.0 in [row["p50"] for row in cur if row.get("p50") is not None]
+
+
+def test_align_next30_plots_old_guess_on_the_current_half_hour():
+    from energy_forecast.live import _align_next30_target
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-09-29T08:30:00Z"]),
+            "issued_at": pd.to_datetime(["2026-09-29T08:00:00Z"]),
+            "p50": [20000.0],
+        }
+    )
+    out = _align_next30_target(frame)
+    assert pd.Timestamp(out["timestamp"].iloc[0]) == pd.Timestamp("2026-09-29T08:00:00Z")
+
+
 def test_complete_midnight_day_needs_every_half_hour():
     from energy_forecast.live import complete_midnight_day, london_day_range, previous_london_midnight
 

@@ -254,8 +254,9 @@ def run_pack(
     stamps = pd.to_datetime(featured["timestamp"], utc=True)
     scored = featured.loc[(stamps >= start) & (stamps < start + horizon)].copy()
     if role == "hour":
-        nxt = now + pd.Timedelta(minutes=30)
-        one = scored.loc[scored["timestamp"] == nxt]
+        target = now.tz_convert("UTC") if now.tzinfo else now.tz_localize("UTC")
+        scored_ts = pd.to_datetime(scored["timestamp"], utc=True)
+        one = scored.loc[scored_ts == target]
         scored = one if not one.empty else scored.head(1)
     if scored.empty:
         raise RuntimeError(f"run_pack({role!r}) produced no future rows")
