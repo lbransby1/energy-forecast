@@ -23,6 +23,9 @@ def test_dashboard_html():
     assert "Yesterday’s forecast vs actual" in response.text or "yesterday" in response.text.lower()
     assert "Yesterday forecast CSV" in response.text
     assert "How the guesses did" in response.text
+    assert "How the models were trained" in response.text
+    assert "WANDB_PROJECT_URL" in response.text
+    assert 'class="side"' in response.text
     assert response.text.index('id="next30"') < response.text.index('id="n30-audit"')
     assert "Segoe UI" in response.text
     assert "Georgia" not in response.text
@@ -52,5 +55,6 @@ def test_board_json_shape(monkeypatch):
     response = client.get("/board")
     assert response.status_code == 200
     body = response.json()
-    assert set(body) >= {"as_of", "next30", "day", "week", "eval"}
+    assert set(body) >= {"as_of", "next30", "day", "week", "eval", "lab"}
     assert "scored" in body["eval"]
+    assert {row["id"] for row in body["lab"]["packs"]} == {"hour", "day", "week"}

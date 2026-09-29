@@ -259,23 +259,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .swatch.red { background: #c45c26; height: 5px; }
     .swatch.blue { background: #9bb8d3; }
     .panel { background: #fff; border: 1px solid #ddd4c4; padding: 14px 16px 10px; margin: 0; }
-    .board { display: grid; grid-template-columns: 1fr 1fr minmax(260px, 22rem); grid-template-areas: "week week eval" "day n30 eval"; gap: 14px; align-items: start; margin: 14px 0; }
+    .board { display: grid; grid-template-columns: 1fr 1fr minmax(280px, 24rem); grid-template-areas: "week week side" "day n30 side"; gap: 14px; align-items: start; margin: 14px 0; }
+    .side { grid-area: side; display: flex; flex-direction: column; gap: 14px; }
     .panel.week { grid-area: week; }
     .panel.day { grid-area: day; }
     .panel.n30 { grid-area: n30; }
-    .panel.eval { grid-area: eval; }
-    .eval .cards { margin-top: 8px; }
-    table.eval-miss, table.audit { font-variant-numeric: lining-nums tabular-nums; }
-    table.eval-miss { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 8px; }
-    table.eval-miss th, table.eval-miss td { text-align: left; padding: 4px 5px; border-bottom: 1px solid #eee; }
+    .eval .cards, .lab .cards { margin-top: 8px; }
+    table.eval-miss, table.audit, table.lab-packs { font-variant-numeric: lining-nums tabular-nums; }
+    table.eval-miss, table.lab-packs { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 8px; }
+    table.eval-miss th, table.eval-miss td, table.lab-packs th, table.lab-packs td { text-align: left; padding: 4px 5px; border-bottom: 1px solid #eee; }
     @media (max-width: 1100px) {
-      .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30" "eval"; }
+      .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30" "side"; }
     }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 6px; }
     .card { border: 1px solid #eee; padding: 8px 10px; min-width: 110px; min-height: 4.1rem; cursor: help; display: flex; flex-direction: column; justify-content: space-between; }
     .card b { display: block; font-size: 1.05rem; font-weight: 600; line-height: 1.25; letter-spacing: 0; white-space: nowrap; font-variant-numeric: lining-nums tabular-nums; }
     .links a { margin-right: 12px; color: #1a1a1a; }
+    .links .muted { margin-right: 12px; }
     button { font: inherit; padding: 8px 14px; cursor: pointer; }
     .panel button { font-size: 0.92rem; padding: 6px 12px; margin: 8px 0 4px; }
     .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -291,7 +292,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Grid Demand UK</h1>
-  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. There are three&nbsp;views of the forecast (week, day, half-hour) and a check on finished half-hours on the right. Times are UK. The black line is only drawn after each half-hour has ended.</p>
+  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. There are three&nbsp;views of the forecast (week, day, half-hour), a check on finished half-hours, and a lab column for holdout scores and search. Times are UK. The black line is only drawn after each half-hour has ended.</p>
   <p class="key" aria-label="Chart colour key">
     <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>
     <span><i class="swatch red"></i> Red — the central forecast (most likely demand)</span>
@@ -337,7 +338,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
   </section>
 
-  <section class="panel eval">
+  <div class="side">
+  <section class="panel eval" id="eval">
     <div class="head">
       <div>
         <h2>How the guesses did</h2>
@@ -349,6 +351,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <p class="muted" id="eval-weather"></p>
     <table class="eval-miss" id="eval-miss"></table>
   </section>
+
+  <section class="panel lab" id="lab">
+    <div class="head">
+      <div>
+        <h2>How the models were trained</h2>
+        <p class="muted" id="lab-note">Holdout scores from the last train, not today’s board.</p>
+      </div>
+    </div>
+    <p class="explain">This column is the research trail. <b>Holdout MAE</b> is the last eight weeks used when the pack was fit — a different sample from the live n on the charts. <b>Tuned</b> means Optuna settings were written into that pack. The week pack has a search winner; the 24-hour pack still uses stock LightGBM until you copy a short-study winner in. Weights &amp; Biases and MLflow links appear when those URLs are set on the server.</p>
+    <p class="links" id="lab-links"></p>
+    <table class="lab-packs" id="lab-packs"></table>
+    <table class="lab-packs" id="lab-optuna"></table>
+  </section>
+  </div>
 
   <section class="panel day">
       <div class="head">
@@ -379,13 +395,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/inputs/next30">Input check JSON</a>
         </div>
       </div>
-      <p class="explain">This chart is today from midnight, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Yesterday is included only after that calendar day is a complete midnight-to-midnight set of official outturn. Pale red is what was written at the time. Dots are the live guess still waiting.</p>
+      <p class="explain">This chart is the last six hours, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Pale red is what was written at the time. Dots are the live guess still waiting.</p>
       <div class="cards" id="n30-cards"></div>
       <button type="button" data-preset="next30">Re-issue next 30</button>
       <div class="chart-wrap half"><canvas id="next30"></canvas></div>
       <dl class="glossary" aria-label="Next 30 minute extra cards">
-        <dt>Generated</dt>
-        <dd>When this half-hour guess was written.</dd>
         <dt>Target</dt>
         <dd>The end of the half-hour being guessed. 1:30 means 1:00–1:30, matching the black line.</dd>
         <dt>Live P50</dt>
@@ -644,8 +658,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? `<div class="card" title="Yesterday’s freeze: typical miss once the day had finished."><span class="muted">Yesterday MAE</span><b>${day.previous.metrics.mae != null ? fmt(day.previous.metrics.mae) + " MW" : "—"}</b></div>`
           : "");
       cards(document.getElementById("n30-cards"), n30.metrics, live.timestamp
-        ? `<div class="card" title="When this half-hour guess was written."><span class="muted">Generated</span><b>${london(live.issued_at)}</b></div>
-           <div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
+        ? `<div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
            <div class="card" title="The current red-line guess for that half-hour, in megawatts."><span class="muted">Live P50</span><b>${fmt(live.p50)} MW</b></div>`
         : "");
       const inp = n30.inputs || {};
@@ -676,6 +689,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
       drawNext30(n30.history || [], live);
       drawEval(board.eval || {});
+      drawLab(board.lab || {});
     }
 
     function drawEval(ev) {
@@ -707,6 +721,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <td>${fmt(row.actual_mw)}</td>
             <td>${fmt(row.error_mw)}</td>
             <td>${row.tag || ""}</td>
+          </tr>`).join("")
+        + "</tbody>";
+    }
+
+    function drawLab(lab) {
+      const packs = lab.packs || [];
+      const optuna = lab.optuna || [];
+      const tracking = lab.tracking || {};
+      const tuned = packs.filter((row) => row.tuned).length;
+      document.getElementById("lab-note").textContent = packs.length
+        ? (tuned + " of " + packs.length + " packs have an Optuna winner in production")
+        : "No saved packs on this box.";
+      const links = [];
+      if (tracking.notebook) links.push(`<a href="${tracking.notebook}">Optuna notebook</a>`);
+      if (tracking.wandb) links.push(`<a href="${tracking.wandb}">Weights &amp; Biases</a>`);
+      else links.push('<span class="muted" title="Set WANDB_PROJECT_URL on the server to show a live W&amp;B project.">W&amp;B — set WANDB_PROJECT_URL</span>');
+      if (tracking.mlflow) links.push(`<a href="${tracking.mlflow}">MLflow</a>`);
+      else links.push('<span class="muted" title="Set MLFLOW_UI_URL on the server to show the tracking UI.">MLflow — set MLFLOW_UI_URL</span>');
+      document.getElementById("lab-links").innerHTML = links.join(" · ");
+      const packTable = document.getElementById("lab-packs");
+      packTable.innerHTML = "<thead><tr><th>Pack</th><th>Search</th><th>Holdout MAE</th><th>Coverage</th><th>Trees</th><th>Tuned</th></tr></thead><tbody>"
+        + packs.map((row) => `<tr>
+            <td title="${row.note || ""}">${row.label || row.id}</td>
+            <td>${row.search || "—"}</td>
+            <td>${row.holdout_mae != null ? fmt(row.holdout_mae) + " MW" : "—"}</td>
+            <td>${row.holdout_coverage != null ? (100 * row.holdout_coverage).toFixed(0) + "%" : "—"}</td>
+            <td>${fmt(row.n_estimators)}</td>
+            <td>${row.tuned ? "Optuna" : "defaults"}</td>
+          </tr>`).join("")
+        + "</tbody>";
+      const studyTable = document.getElementById("lab-optuna");
+      studyTable.innerHTML = "<thead><tr><th>Study</th><th>Trials</th><th>Best MAE</th></tr></thead><tbody>"
+        + optuna.map((row) => `<tr>
+            <td>${row.product || ""}</td>
+            <td>${row.ready ? fmt(row.n_complete) + " complete" : "no local db"}</td>
+            <td>${row.best_mae != null ? fmt(row.best_mae) + " MW" : "—"}</td>
           </tr>`).join("")
         + "</tbody>";
     }

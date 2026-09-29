@@ -24,6 +24,7 @@ from energy_forecast.forecast import (
     run_pack,
     validation_metrics,
 )
+from energy_forecast.lab import model_lab_payload
 from energy_forecast.modes import MEDIUM, SHORT
 from energy_forecast.paths import DATA_LIVE, ensure_data_dirs
 from energy_forecast.settlement import LONDON_TZ
@@ -32,6 +33,7 @@ ARCHIVE_NAME = "archive.parquet"
 BOARD_NAME = "board.parquet"
 CONTEXT_NAME = "context_actuals.parquet"
 NEXT30 = "next30"
+NEXT30_CHART_HOURS = 6
 DAY = "day"
 WEEK = "week"
 PRESETS = (NEXT30, DAY, WEEK)
@@ -1051,11 +1053,9 @@ def _next30_history(
     now_utc: pd.Timestamp,
     context: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Today from midnight, plus yesterday only if that London day is complete (all half-hours)."""
-    today = day_window(now_utc)
-    yesterday = previous_london_midnight(now_utc)
-    check = context if context is not None and not context.empty else next30
-    cutoff = yesterday if complete_midnight_day(yesterday, check, column="actual_mw", now=now_utc) else today
+    """Issued guesses and INDO for the last six hours, up to the live target."""
+    now_utc = _as_utc(now_utc)
+    cutoff = now_utc - pd.Timedelta(hours=NEXT30_CHART_HOURS)
     history = next30.copy()
     if not history.empty:
         if "issued_at" in history.columns:
@@ -1252,6 +1252,7 @@ def board_payload(*, refresh: bool = False) -> dict:
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
         },
         "eval": evaluation_payload(board, context, audit),
+        "lab": model_lab_payload(),
     }
     _BOARD_CACHE["at"] = time.monotonic()
     _BOARD_CACHE["payload"] = payload

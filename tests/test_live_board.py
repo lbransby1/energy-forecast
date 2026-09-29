@@ -276,46 +276,27 @@ def test_complete_midnight_day_needs_every_half_hour():
     assert not complete_midnight_day(yesterday, full.iloc[:10], column="actual_mw", now=now)
 
 
-def test_next30_history_skips_incomplete_yesterday():
+def test_next30_history_is_last_six_hours():
     from energy_forecast.live import _next30_history
 
-    now = pd.Timestamp("2026-09-29T08:00:00", tz="Europe/London")
+    now = pd.Timestamp("2026-09-29T12:00:00Z")
     next30 = pd.DataFrame(
         {
-            "timestamp": pd.to_datetime(["2026-09-28T08:00:00Z", "2026-09-29T07:00:00Z"]),
-            "issued_at": pd.to_datetime(["2026-09-28T08:10:00Z", "2026-09-29T07:10:00Z"]),
-            "p50": [20000.0, 21000.0],
+            "timestamp": pd.to_datetime(
+                ["2026-09-29T04:00:00Z", "2026-09-29T08:00:00Z", "2026-09-29T12:00:00Z"]
+            ),
+            "issued_at": pd.to_datetime(
+                ["2026-09-29T04:10:00Z", "2026-09-29T08:10:00Z", "2026-09-29T11:40:00Z"]
+            ),
+            "p50": [20000.0, 21000.0, 22000.0],
         }
     )
     live = next30.iloc[-1:]
-    out = _next30_history(next30, live, now.tz_convert("UTC"), pd.DataFrame())
+    out = _next30_history(next30, live, now, pd.DataFrame())
     stamps = set(pd.to_datetime(out["timestamp"], utc=True))
-    assert pd.Timestamp("2026-09-28T08:00:00Z") not in stamps
-    assert pd.Timestamp("2026-09-29T07:00:00Z") in stamps
-
-
-def test_next30_history_includes_complete_yesterday():
-    from energy_forecast.live import _next30_history, london_day_range, previous_london_midnight
-
-    now = pd.Timestamp("2026-09-29T08:00:00", tz="Europe/London")
-    yesterday = previous_london_midnight(now)
-    start, _end, n = london_day_range(yesterday)
-    idx = pd.date_range(start, periods=n, freq="30min", tz="UTC")
-    context = pd.DataFrame({"timestamp": idx, "actual_mw": 20000.0})
-    next30 = pd.DataFrame(
-        {
-            "timestamp": pd.to_datetime([idx[16], "2026-09-29T07:00:00Z"]),
-            "issued_at": pd.to_datetime(["2026-09-28T08:10:00Z", "2026-09-29T07:10:00Z"]),
-            "p50": [20000.0, 21000.0],
-            "actual_mw": [20000.0, None],
-        }
-    )
-    live = next30.iloc[-1:]
-    out = _next30_history(next30, live, now.tz_convert("UTC"), context)
-    stamps = set(pd.to_datetime(out["timestamp"], utc=True))
-    assert idx[16] in stamps
-    assert pd.Timestamp("2026-09-29T07:00:00Z") in stamps
-    assert len(out) >= n
+    assert pd.Timestamp("2026-09-29T04:00:00Z") not in stamps
+    assert pd.Timestamp("2026-09-29T08:00:00Z") in stamps
+    assert pd.Timestamp("2026-09-29T12:00:00Z") in stamps
 
 
 def test_evaluation_tags_outside_band_and_lags():

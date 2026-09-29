@@ -130,7 +130,7 @@ Eval: 56-day holdout at display frequency; WRMSSE vs weekly seasonal naive (1.0 
 1. New project → Deploy from GitHub repo.
 2. Builder: Dockerfile (`railway.toml`).
 3. Volume mount `data/live` (and optionally `data/processed`) so the board survives deploys.
-4. Variables: `WEEK_REISSUE_PASSWORD`, optional `LIVE_TOKEN`, `PORT` (Railway injects this).
+4. Variables: `WEEK_REISSUE_PASSWORD`, optional `LIVE_TOKEN`, optional `WANDB_PROJECT_URL` / `MLFLOW_UI_URL` (lab column links), `PORT` (Railway injects this).
 5. Healthcheck: `GET /health`.
 
 First capture on a cold box fetches weather and is slow. The **website** stays fast because `/` and `/board` do not wait on that.
