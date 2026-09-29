@@ -208,9 +208,53 @@ def week_window(when: pd.Timestamp | None = None) -> pd.Timestamp:
     return monday.tz_convert("UTC")
 
 
+def previous_week_window(when: pd.Timestamp | None = None) -> pd.Timestamp:
+    """Last Monday 00:00 Europe/London, as UTC."""
+    return week_window(when) - pd.Timedelta(days=7)
+
+
 def _as_utc(stamp: pd.Timestamp) -> pd.Timestamp:
     out = pd.Timestamp(stamp)
     return out.tz_convert("UTC") if out.tzinfo else out.tz_localize("UTC")
+
+
+def previous_london_midnight(when: pd.Timestamp | None = None) -> pd.Timestamp:
+    """Yesterday 00:00 Europe/London, as UTC."""
+    today_local = day_window(when).tz_convert(LONDON_TZ)
+    return (today_local - pd.Timedelta(days=1)).normalize().tz_convert("UTC")
+
+
+def london_day_range(start: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp, int]:
+    """UTC [start, end) and expected half-hours for a London calendar day starting at midnight."""
+    start = _as_utc(start)
+    midnight = start.tz_convert(LONDON_TZ).normalize()
+    if start.tz_convert(LONDON_TZ) != midnight:
+        return start, start, 0
+    end_local = midnight + pd.Timedelta(days=1)
+    expected = len(pd.date_range(midnight, end_local, freq="30min", inclusive="left"))
+    return midnight.tz_convert("UTC"), end_local.tz_convert("UTC"), int(expected)
+
+
+def complete_midnight_day(
+    start: pd.Timestamp,
+    frame: pd.DataFrame,
+    *,
+    column: str,
+    now: pd.Timestamp | None = None,
+) -> bool:
+    """True when `start` is London midnight, that day has ended, and every SP has `column`."""
+    start_utc, end_utc, expected = london_day_range(start)
+    if expected <= 0:
+        return False
+    now = now or london_now()
+    if _as_utc(now) < end_utc:
+        return False
+    if frame is None or frame.empty or "timestamp" not in frame.columns or column not in frame.columns:
+        return False
+    work = frame.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+    slice_ = work.loc[(work["timestamp"] >= start_utc) & (work["timestamp"] < end_utc)].dropna(subset=[column])
+    return int(slice_["timestamp"].drop_duplicates().shape[0]) == expected
 
 
 def _frozen_path(preset: str, window_start: pd.Timestamp):
@@ -305,15 +349,21 @@ def week_password_ok(given: str | None) -> bool:
     return hmac.compare_digest(left, right)
 
 
-def _run_pack_retry(role: str, hours: float, *, retry: bool) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _run_pack_retry(
+    role: str,
+    hours: float,
+    *,
+    retry: bool,
+    origin: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Hour pack: retry once after 20s if Insights INDO is still catching up."""
     try:
-        return run_pack(role=role, horizon_hours=hours)
+        return run_pack(role=role, horizon_hours=hours, origin=origin)
     except RuntimeError:
         if not retry:
             raise
         time.sleep(20)
-        return run_pack(role=role, horizon_hours=hours)
+        return run_pack(role=role, horizon_hours=hours, origin=origin)
 
 
 def capture_preset(preset: str, *, force: bool = False, week_password: str | None = None) -> dict:
@@ -352,8 +402,9 @@ def _capture_preset(preset: str, *, force: bool = False, week_password: str | No
         if not week_password_ok(week_password):
             raise WeekReissueLocked("week freeze is locked; password required to re-issue")
 
+    origin = None if preset == NEXT30 else window_start
     try:
-        forecast, frozen = _run_pack_retry(role, hours, retry=(preset == NEXT30))
+        forecast, frozen = _run_pack_retry(role, hours, retry=(preset == NEXT30), origin=origin)
     except RuntimeError as exc:
         if preset != NEXT30:
             raise
@@ -519,6 +570,30 @@ def _window_rows(preset: str, window_start: pd.Timestamp | None, board: pd.DataF
     return frame.loc[frame["window_start"] == start].sort_values("timestamp")
 
 
+def _in_time_range(frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    if frame is None or frame.empty or "timestamp" not in frame.columns:
+        return pd.DataFrame() if frame is None else frame.iloc[0:0].copy()
+    work = frame.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+    start_u, end_u = _as_utc(start), _as_utc(end)
+    return work.loc[(work["timestamp"] >= start_u) & (work["timestamp"] < end_u)].copy()
+
+
+def _span_rows(preset: str, start: pd.Timestamp, end: pd.Timestamp, board: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Forecast rows whose target timestamps fall in [start, end), preferring that Monday's freeze."""
+    frame = _in_time_range(_preset_frame(preset, board), start, end)
+    if frame.empty:
+        return frame
+    start_u = _as_utc(start)
+    if "window_start" in frame.columns:
+        native = frame.loc[pd.to_datetime(frame["window_start"], utc=True) == start_u]
+        if not native.empty and "p50" in native.columns and native["p50"].notna().any():
+            return native.sort_values("timestamp")
+    if "issued_at" in frame.columns:
+        frame = frame.sort_values(["timestamp", "issued_at"]).drop_duplicates("timestamp", keep="last")
+    return frame.sort_values("timestamp")
+
+
 def scored_preset(preset: str, window_start: pd.Timestamp | None = None) -> pd.DataFrame:
     frame = _window_rows(preset, window_start) if window_start is not None else _preset_frame(preset)
     if frame.empty or "actual_mw" not in frame.columns:
@@ -545,6 +620,8 @@ def preset_metrics(frame: pd.DataFrame, *, compute_wrmsse: bool = True) -> dict:
         ).dropna()
         if len(band):
             width = float(band.mean())
+    if "actual_mw" not in frame.columns or "p50" not in frame.columns:
+        return {**empty, "interval_width": width}
     scored = frame.dropna(subset=["actual_mw", "p50"])
     if scored is None or scored.empty:
         return {**empty, "interval_width": width}
@@ -789,11 +866,15 @@ def _window_payload(
     *,
     wrmsse: float | None = None,
     context: pd.DataFrame | None = None,
+    rows: pd.DataFrame | None = None,
 ) -> dict:
-    rows = _window_rows(preset, window_start, board)
+    rows = _window_rows(preset, window_start, board) if rows is None else rows
+    if not rows.empty:
+        rows = rows.sort_values("timestamp")
     if context is not None:
         rows = _overlay_actuals(rows, context)
-    scored = rows.dropna(subset=["actual_mw", "p50"]) if not rows.empty else rows
+    needed = [column for column in ("actual_mw", "p50") if column in rows.columns]
+    scored = rows.dropna(subset=needed) if not rows.empty and needed else rows
     metrics = preset_metrics(rows, compute_wrmsse=False)
     if wrmsse is not None:
         metrics["wrmsse"] = wrmsse
@@ -815,22 +896,27 @@ def _previous_actuals(
     board: pd.DataFrame,
     context: pd.DataFrame | None = None,
 ) -> list[dict]:
-    """Yesterday / last week INDO. Prefer the previous freeze; else the context file."""
-    if len(windows) >= 2:
-        rows = _window_rows(preset, windows[1], board)
-        if not rows.empty and "actual_mw" in rows.columns:
-            keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in rows.columns]
-            scored = _frame_records(rows.loc[:, keep].dropna(subset=["actual_mw"]))
-            if scored:
-                return scored
+    """Yesterday / last week INDO, clipped to that calendar window (partial days are fine)."""
     now = london_now()
+    ctx = context if context is not None else load_context_actuals()
     if preset == DAY:
-        end = day_window(now)
-        start = end - pd.Timedelta(days=1)
-    else:
-        end = week_window(now)
-        start = end - pd.Timedelta(days=7)
-    chunk = _slice_actuals(context if context is not None else load_context_actuals(), start, end)
+        start, end, _ = london_day_range(previous_london_midnight(now))
+        chunk = _slice_actuals(ctx, start, end)
+        if chunk.empty:
+            rows = _overlay_actuals(_span_rows(DAY, start, end, board), ctx)
+            if not rows.empty and "actual_mw" in rows.columns:
+                chunk = rows.dropna(subset=["actual_mw"])
+        if chunk.empty:
+            return []
+        keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in chunk.columns]
+        return _frame_records(chunk.loc[:, keep].dropna(subset=["actual_mw"]))
+    end = week_window(now)
+    start = previous_week_window(now)
+    chunk = _slice_actuals(ctx, start, end)
+    if chunk.empty:
+        rows = _overlay_actuals(_span_rows(WEEK, start, end, board), ctx)
+        if not rows.empty and "actual_mw" in rows.columns:
+            chunk = rows.dropna(subset=["actual_mw"])
     if chunk.empty:
         return []
     keep = [column for column in ("timestamp", "actual_mw", "settlement_period") if column in chunk.columns]
@@ -843,19 +929,22 @@ def _next30_history(
     now_utc: pd.Timestamp,
     context: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Last 6h of issued calls, with INDO filled in even when those periods were never frozen."""
+    """Today from midnight, plus yesterday only if that London day is complete (all half-hours)."""
+    today = day_window(now_utc)
+    yesterday = previous_london_midnight(now_utc)
+    check = context if context is not None and not context.empty else next30
+    cutoff = yesterday if complete_midnight_day(yesterday, check, column="actual_mw", now=now_utc) else today
     history = next30.copy()
     if not history.empty:
         if "issued_at" in history.columns:
             history = history.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
-        cutoff = now_utc - pd.Timedelta(hours=6)
         history = history.loc[pd.to_datetime(history["timestamp"], utc=True) >= cutoff]
         if not live30.empty:
             cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True)
             history = history.loc[pd.to_datetime(history["timestamp"], utc=True) <= cap]
     history = _overlay_actuals(history, context)
     cap = pd.to_datetime(live30["timestamp"].iloc[0], utc=True) if not live30.empty else now_utc
-    trail = _slice_actuals(context, now_utc - pd.Timedelta(hours=6), cap + pd.Timedelta(seconds=1))
+    trail = _slice_actuals(context, cutoff, cap + pd.Timedelta(seconds=1))
     if trail.empty:
         return history.sort_values("timestamp") if not history.empty else history
     have = (
@@ -885,7 +974,7 @@ def evaluation_payload(
     large = 0
     for preset in PRESETS:
         frame = _overlay_actuals(_preset_frame(preset, board), context)
-        if frame.empty or "p50" not in frame.columns:
+        if frame.empty or "p50" not in frame.columns or "actual_mw" not in frame.columns:
             continue
         work = frame.dropna(subset=["actual_mw", "p50"]).copy()
         if work.empty:
@@ -977,6 +1066,13 @@ def board_payload(*, refresh: bool = False) -> dict:
     n30_metrics = preset_metrics(_overlay_actuals(next30, context), compute_wrmsse=False)
     n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
     audit = next30_input_audit(next30, use_network=False)
+    yesterday = previous_london_midnight(now)
+    today = day_window(now)
+    y_start, y_end, _ = london_day_range(yesterday)
+    t_start, t_end, _ = london_day_range(today)
+    this_monday = week_window(now)
+    last_monday = previous_week_window(now)
+    next_monday = this_monday + pd.Timedelta(days=7)
     payload = {
         "as_of": now.isoformat(),
         "next30": {
@@ -987,13 +1083,40 @@ def board_payload(*, refresh: bool = False) -> dict:
             "audit": audit,
         },
         "day": {
-            "current": _window_payload(DAY, day_windows[0] if day_windows else None, board, wrmsse=wrmsse.get(DAY), context=context),
-            "previous": _window_payload(DAY, day_windows[1] if len(day_windows) > 1 else None, board, context=context),
+            "boundary": t_start.isoformat(),
+            "current": _window_payload(
+                DAY,
+                today,
+                board,
+                wrmsse=wrmsse.get(DAY),
+                context=context,
+                rows=_span_rows(DAY, t_start, t_end, board),
+            ),
+            "previous": _window_payload(
+                DAY,
+                yesterday,
+                board,
+                context=context,
+                rows=_span_rows(DAY, y_start, y_end, board),
+            ),
             "previous_actuals": _previous_actuals(DAY, day_windows, board, context),
         },
         "week": {
-            "current": _window_payload(WEEK, week_windows[0] if week_windows else None, board, wrmsse=wrmsse.get(WEEK), context=context),
-            "previous": _window_payload(WEEK, week_windows[1] if len(week_windows) > 1 else None, board, context=context),
+            "current": _window_payload(
+                WEEK,
+                this_monday,
+                board,
+                wrmsse=wrmsse.get(WEEK),
+                context=context,
+                rows=_span_rows(WEEK, this_monday, next_monday, board),
+            ),
+            "previous": _window_payload(
+                WEEK,
+                last_monday,
+                board,
+                context=context,
+                rows=_span_rows(WEEK, last_monday, this_monday, board),
+            ),
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
         },
         "eval": evaluation_payload(board, context, audit),
@@ -1004,6 +1127,15 @@ def board_payload(*, refresh: bool = False) -> dict:
 
 
 def forecast_csv(preset: str, which: str = "current") -> str:
+    if preset == WEEK:
+        start = week_window() if which != "previous" else previous_week_window()
+        rows = _span_rows(WEEK, start, start + pd.Timedelta(days=7))
+        return _to_csv(rows)
+    if preset == DAY:
+        start = day_window() if which != "previous" else previous_london_midnight()
+        start_u, end_u, _ = london_day_range(start)
+        rows = _span_rows(DAY, start_u, end_u)
+        return _to_csv(rows)
     windows = _windows(preset)
     if not windows:
         return ""
@@ -1013,6 +1145,9 @@ def forecast_csv(preset: str, which: str = "current") -> str:
 
 
 def frozen_csv(preset: str, which: str = "current") -> str:
+    if preset == WEEK:
+        start = week_window() if which != "previous" else previous_week_window()
+        return _to_csv(load_frozen(WEEK, start))
     windows = _windows(preset)
     if not windows:
         return ""

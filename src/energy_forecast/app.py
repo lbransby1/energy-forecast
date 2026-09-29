@@ -157,12 +157,23 @@ def download_frozen(preset: str, which: str = Query(default="current")) -> Respo
 def inputs(preset: str, which: str = Query(default="current")) -> dict:
     if preset not in PRESETS:
         raise HTTPException(status_code=404, detail="unknown preset")
-    from energy_forecast.live import _windows, input_health, load_frozen, next30_input_audit, _preset_frame
+    from energy_forecast.live import (
+        _windows,
+        input_health,
+        load_frozen,
+        next30_input_audit,
+        _preset_frame,
+        previous_week_window,
+        week_window,
+    )
 
-    windows = _windows(preset)
-    if not windows:
-        raise HTTPException(status_code=404, detail="no window for that preset")
-    window = windows[0] if which != "previous" else (windows[1] if len(windows) > 1 else windows[0])
+    if preset == "week":
+        window = week_window() if which != "previous" else previous_week_window()
+    else:
+        windows = _windows(preset)
+        if not windows:
+            raise HTTPException(status_code=404, detail="no window for that preset")
+        window = windows[0] if which != "previous" else (windows[1] if len(windows) > 1 else windows[0])
     payload = input_health(preset, window)
     payload["preset"] = preset
     payload["window_start"] = window.isoformat() if hasattr(window, "isoformat") else str(window)
@@ -298,6 +309,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <dd>Average gap between the two blue lines across the <b>whole issued forecast</b> (including hours that have not finished yet). The week fan is meant to get wider later in the week, so that pulls this number up. MAE and coverage still use only finished half-hours (<b>n</b>).</dd>
   </dl>
   <p>
+    <button type="button" id="reload">Reload board</button>
     <button type="button" id="capture">Issue due presets</button>
     <span class="muted" id="note">Loading board…</span>
   </p>
@@ -316,7 +328,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <a href="/download/week/frozen?which=previous">Previous inputs</a>
       </div>
     </div>
-    <p class="explain">This chart is the week ahead. The left-hand black line is last week’s actual electricity use. From Monday the red and blue lines are this week’s forecast, written once and not changed. As each half-hour of this week finishes, a black line is drawn on top of the forecast so you can see whether the guess was high or low. Scores in the boxes only use hours that already have that official black line.</p>
+    <p class="explain">This chart is last week then this week, in calendar order from last Monday. The complete-midnight-day rule is only for the day and next-30 charts. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Scores in the boxes only use hours of this week that already have a black line.</p>
     <div class="cards" id="week-cards"></div>
     <button type="button" data-preset="week">Re-issue week (password)</button>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
@@ -347,7 +359,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/download/day?which=previous">Yesterday forecast CSV</a>
         </div>
       </div>
-      <p class="explain">This chart is two days. If yesterday’s midnight freeze is still on disk, the left side is that forecast (pale red and blue) plus the black official outturn. The right side is today’s forecast. If you only see a black line on the left, this box did not keep yesterday’s freeze (first deploy, or it was never issued). Scores in the boxes are for today only; yesterday’s scores are in the CSV link.</p>
+      <p class="explain">The left side is yesterday’s London calendar day, from the first stored half-hour until midnight. A late freeze (for example issued at 9am) still stops at midnight; it does not run into today. From midnight the bright lines are today’s forecast. Scores in the boxes are for today.</p>
       <div class="cards" id="day-cards"></div>
       <button type="button" data-preset="day">Re-issue day</button>
       <div class="chart-wrap half"><canvas id="day"></canvas></div>
@@ -364,7 +376,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/inputs/next30">Input check JSON</a>
         </div>
       </div>
-      <p class="explain">This chart is the last few hours, one guess per half-hour. Pale red is what was written at the time. The bright red and blue dots are the guess for the half-hour that has not finished yet, so there is no black line there. Black appears once the official outturn is published (usually a few minutes after the half-hour ends).</p>
+      <p class="explain">This chart is today from midnight, one guess per half-hour. Yesterday is included only after that calendar day is a complete midnight-to-midnight set of official outturn. Pale red is what was written at the time. Dots are the live guess still waiting. Black appears once the official number is published.</p>
       <div class="cards" id="n30-cards"></div>
       <button type="button" data-preset="next30">Re-issue next 30</button>
       <div class="chart-wrap half"><canvas id="next30"></canvas></div>
@@ -403,6 +415,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const p = londonParts(ts);
       if (!p) return "";
       return withDay ? `${p.day} ${p.month}, ${p.hour}:${p.minute}` : `${p.hour}:${p.minute}`;
+    }
+
+    function stampMs(ts) {
+      const t = Date.parse(ts);
+      return Number.isNaN(t) ? null : t;
+    }
+
+    function indexRows(rows) {
+      const map = new Map();
+      for (const row of rows || []) {
+        const ms = stampMs(row.timestamp);
+        if (ms == null) continue;
+        map.set(ms, Object.assign({}, map.get(ms) || {}, row));
+      }
+      return map;
+    }
+
+    function halfHourGrid(maps) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (const map of maps) {
+        for (const ms of map.keys()) {
+          if (ms < min) min = ms;
+          if (ms > max) max = ms;
+        }
+      }
+      if (!Number.isFinite(min)) return [];
+      const step = 30 * 60 * 1000;
+      min = Math.floor(min / step) * step;
+      max = Math.ceil(max / step) * step;
+      const out = [];
+      for (let t = min; t <= max; t += step) out.push(t);
+      return out;
     }
 
     function axisTick(ts, mode) {
@@ -496,15 +541,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       ];
     }
 
-    function drawWindow(id, previous, fallbackActuals, current, title, mode, pastLabel) {
-      const issued = (previous && previous.rows) || [];
+    function rowsBefore(rows, endMs) {
+      if (endMs == null) return rows || [];
+      return (rows || []).filter((row) => {
+        const ms = stampMs(row.timestamp);
+        return ms != null && ms < endMs;
+      });
+    }
+
+    function rowsFrom(rows, startMs) {
+      if (startMs == null) return rows || [];
+      return (rows || []).filter((row) => {
+        const ms = stampMs(row.timestamp);
+        return ms != null && ms >= startMs;
+      });
+    }
+
+    function drawWindow(id, previous, fallbackActuals, current, title, mode, pastLabel, seamMs) {
+      const issued = rowsBefore((previous && previous.rows) || [], seamMs);
       const hasPrevFan = issued.some((row) => row.p50 != null || row.p10 != null);
-      const prev = hasPrevFan ? issued : (fallbackActuals || []);
-      const cur = (current && current.rows) || [];
-      const labels = prev.map((row) => row.timestamp).concat(cur.map((row) => row.timestamp));
-      const left = (key) => prev.map((row) => row[key]).concat(cur.map(() => null));
-      const right = (key) => prev.map(() => null).concat(cur.map((row) => row[key]));
-      const indo = prev.map((row) => row.actual_mw).concat(cur.map((row) => row.actual_mw));
+      const prevMap = indexRows(rowsBefore(fallbackActuals || [], seamMs));
+      for (const row of issued) {
+        const ms = stampMs(row.timestamp);
+        if (ms == null) continue;
+        prevMap.set(ms, Object.assign({}, prevMap.get(ms) || {}, row));
+      }
+      const curMap = indexRows(rowsFrom((current && current.rows) || [], seamMs));
+      const grid = halfHourGrid([prevMap, curMap]);
+      const labels = grid.map((ms) => new Date(ms).toISOString());
+      const prevAt = (ms) => prevMap.get(ms) || {};
+      const curAt = (ms) => curMap.get(ms) || {};
+      const left = (key) => grid.map((ms) => {
+        const v = prevAt(ms)[key];
+        return v == null ? null : v;
+      });
+      const right = (key) => grid.map((ms) => {
+        const v = curAt(ms)[key];
+        return v == null ? null : v;
+      });
+      const indo = grid.map((ms) => {
+        const cur = curAt(ms).actual_mw;
+        if (cur != null) return cur;
+        const prev = prevAt(ms).actual_mw;
+        return prev == null ? null : prev;
+      });
       const past = pastLabel || "Previous";
       const datasets = [
         { label: "Actual", data: indo, borderColor: "#111", pointRadius: 0, borderWidth: 2, spanGaps: false },
@@ -537,13 +617,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               ? " · left = last week’s forecast vs actual"
               : " · left = last week actual only (no stored last-week freeze)"))
           : "No week forecast yet — it is written Monday midnight UK, or click Issue due presets.";
+      const yestFan = day.previous && day.previous.issued_at;
+      const yestActuals = day.previous_actuals && day.previous_actuals.length;
       document.getElementById("day-note").textContent =
         (day.current && day.current.issued_at)
           ? ("Written " + london(day.current.issued_at)
-            + ((day.previous && day.previous.issued_at)
-              ? " · left = yesterday’s forecast vs actual"
-              : " · left = yesterday actual only (no stored yesterday freeze)"))
+            + (yestFan
+              ? " · left = yesterday until midnight"
+              : (yestActuals
+                ? " · left = yesterday actual until midnight"
+                : " · no yesterday freeze in range")))
           : "No day forecast yet — it is written at midnight UK, or click Issue due presets.";
+      const dayTitle = (yestFan || yestActuals)
+        ? "Yesterday until midnight, then today’s forecast"
+        : "Today’s forecast";
       document.getElementById("n30-note").textContent = live.timestamp
         ? ("Guessing " + london(live.timestamp) + " · written " + london(live.issued_at)
           + " · most likely " + fmt(live.p50) + " MW")
@@ -582,8 +669,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <td>${fmt(r.p50)}</td><td>${fmt(r.actual_mw)}</td><td>${mark}</td></tr>`;
           }).join("") + "</tbody>";
       }
-      drawWindow("week", week.previous, week.previous_actuals, week.current, "Last week, then this week’s forecast", "week", "Last week");
-      drawWindow("day", day.previous, day.previous_actuals, day.current, "Yesterday’s forecast vs actual, then today’s forecast", "day", "Yesterday");
+      drawWindow("week", week.previous, week.previous_actuals, week.current, "Last week, then this week’s forecast", "week", "Last week", stampMs(week.current && week.current.window_start));
+      drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
       drawNext30(n30.history || [], live);
       drawEval(board.eval || {});
     }
@@ -625,6 +712,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const liveTs = live && live.timestamp;
       const rows = hist.slice();
       if (liveTs && !rows.some((row) => row.timestamp === liveTs)) rows.push(live);
+      rows.sort((a, b) => (stampMs(a.timestamp) || 0) - (stampMs(b.timestamp) || 0));
       const labels = rows.map((row) => row.timestamp);
       const liveDot = (key) => rows.map((row) => row.timestamp === liveTs ? row[key] : null);
       lineChart("next30", labels, [
@@ -681,34 +769,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (err) { note.textContent = String(err); }
     }
     document.getElementById("capture").onclick = () => runCapture(false);
+    document.getElementById("reload").onclick = () => reloadBoard();
     document.querySelectorAll("button[data-preset]").forEach((btn) => {
       btn.onclick = () => reissuePreset(btn.dataset.preset);
     });
 
-    function londonClock() {
-      const parts = new Intl.DateTimeFormat("en-GB", {
-        timeZone: "Europe/London", hour: "2-digit", minute: "2-digit",
-        second: "2-digit", hour12: false, hourCycle: "h23"
-      }).formatToParts(new Date());
-      const num = (type) => Number(parts.find((part) => part.type === type).value);
-      return { minute: num("minute"), second: num("second") };
+    async function reloadBoard() {
+      const note = document.getElementById("note");
+      note.textContent = "Refreshing…";
+      try {
+        await load();
+        note.textContent = "";
+      } catch (err) {
+        note.textContent = String(err);
+      }
     }
-    function msUntilIndoRefresh() {
-      const { minute, second } = londonClock();
-      const through = minute * 60 + second;
-      const slot = through < 10 * 60 ? 10 * 60 : through < 40 * 60 ? 40 * 60 : 70 * 60;
-      return (slot - through) * 1000;
-    }
-    async function waitForIndo() {
-      await new Promise((resolve) => setTimeout(resolve, msUntilIndoRefresh()));
-      await load();
-      waitForIndo();
-    }
+
     load().then(() => { document.getElementById("note").textContent = ""; }).catch((err) => {
       document.getElementById("note").textContent = String(err);
     });
-    setInterval(load, 20000);
-    waitForIndo();
   </script>
 </body>
 </html>

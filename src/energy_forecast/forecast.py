@@ -220,8 +220,17 @@ def run_live_detail(*, horizon_hours: int = 168, model_dir: Path | None = None) 
     return predicted.sort_values("timestamp").reset_index(drop=True)
 
 
-def run_pack(*, role: str, horizon_hours: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Score one pack on the live frame. Returns (forecast, frozen features)."""
+def run_pack(
+    *,
+    role: str,
+    horizon_hours: float,
+    origin: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Score one pack on the live frame. Returns (forecast, frozen features).
+
+    Day and week packs score ``origin`` plus ``horizon_hours`` (Monday / midnight),
+    not “from now”, so a late re-issue still covers that calendar window.
+    """
     if role not in {"hour", "day", "week"}:
         raise ValueError("role must be 'hour', 'day', or 'week'")
     week_models = load_models()
@@ -236,10 +245,14 @@ def run_pack(*, role: str, horizon_hours: float) -> tuple[pd.DataFrame, pd.DataF
         fetch_hours = 168
     featured = prepare_live_frame(horizon_hours=fetch_hours, climatology=week_models.climatology)
     now = pd.Timestamp.now(tz=LONDON_TZ).floor("30min")
+    start = pd.Timestamp(origin) if origin is not None else now
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    else:
+        start = start.tz_convert("UTC")
     horizon = pd.Timedelta(hours=float(horizon_hours))
-    scored = featured.loc[
-        (featured["timestamp"] >= now) & (featured["timestamp"] < now + horizon)
-    ].copy()
+    stamps = pd.to_datetime(featured["timestamp"], utc=True)
+    scored = featured.loc[(stamps >= start) & (stamps < start + horizon)].copy()
     if role == "hour":
         nxt = now + pd.Timedelta(minutes=30)
         one = scored.loc[scored["timestamp"] == nxt]
