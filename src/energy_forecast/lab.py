@@ -13,7 +13,7 @@ PACKS = (
         "id": "hour",
         "label": "Next 30 minutes",
         "dir": DATA_MODELS_HOUR,
-        "search": "hour",
+        "search": "next_hour",
         "note": "ERA5 weather and lag_1 / lag_2. No Optuna winner wired in yet.",
     },
     {
@@ -93,7 +93,17 @@ def _pack_card(spec: dict) -> dict:
     }
 
 
-def _optuna_snapshot(product: str) -> dict:
+def _shipped_studies() -> dict:
+    path = DATA_MODELS / "optuna_studies.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _optuna_from_sqlite(product: str) -> dict:
     path = DATA_PROCESSED / f"optuna_{product}.db"
     base = {
         "product": product,
@@ -129,6 +139,16 @@ def _optuna_snapshot(product: str) -> dict:
         return {**base, "error": "study file present but could not be read"}
 
 
+def _optuna_snapshot(product: str) -> dict:
+    live = _optuna_from_sqlite(product)
+    if live.get("ready"):
+        return live
+    shipped = _shipped_studies().get(product)
+    if shipped:
+        return shipped
+    return live
+
+
 def tracking_links() -> dict:
     wandb = (os.environ.get("WANDB_PROJECT_URL") or os.environ.get("WANDB_URL") or "").strip()
     mlflow = (os.environ.get("MLFLOW_UI_URL") or "").strip()
@@ -143,7 +163,7 @@ def tracking_links() -> dict:
 def model_lab_payload() -> dict:
     """Cards for the three packs plus local Optuna study summaries."""
     packs = [_pack_card(spec) for spec in PACKS]
-    searches = [_optuna_snapshot("short"), _optuna_snapshot("medium")]
+    searches = [_optuna_snapshot("next_hour"), _optuna_snapshot("short"), _optuna_snapshot("medium")]
     return {
         "packs": packs,
         "optuna": searches,

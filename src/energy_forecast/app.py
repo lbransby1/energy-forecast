@@ -359,7 +359,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <p class="muted" id="lab-note">Holdout scores from the last train, not today’s board.</p>
       </div>
     </div>
-    <p class="explain">This column is the research trail. <b>Holdout MAE</b> is the last eight weeks used when the pack was fit — a different sample from the live n on the charts. <b>Tuned</b> means Optuna settings were written into that pack. The week pack has a search winner; the 24-hour pack still uses stock LightGBM until you copy a short-study winner in. Weights &amp; Biases and MLflow links appear when those URLs are set on the server.</p>
+    <p class="explain">This column is the research trail. <b>Holdout MAE</b> is the last eight weeks used when the pack was fit — a different sample from the live n on the charts. <b>Tuned</b> means Optuna settings were written into that pack. The week pack has a search winner; the 24-hour pack still uses stock LightGBM. Trial counts come from the last exported Optuna snapshot shipped with the models. Weights &amp; Biases and MLflow links appear when those URLs are set on the server.</p>
     <p class="links" id="lab-links"></p>
     <table class="lab-packs" id="lab-packs"></table>
     <table class="lab-packs" id="lab-optuna"></table>
@@ -753,11 +753,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         + "</tbody>";
       const studyTable = document.getElementById("lab-optuna");
       studyTable.innerHTML = "<thead><tr><th>Study</th><th>Trials</th><th>Best MAE</th></tr></thead><tbody>"
-        + optuna.map((row) => `<tr>
-            <td>${row.product || ""}</td>
-            <td>${row.ready ? fmt(row.n_complete) + " complete" : "no local db"}</td>
+        + optuna.map((row) => {
+            const names = { next_hour: "Next 30 min", short: "Next 24 hours", medium: "Next week" };
+            const label = names[row.product] || row.product || "";
+            const trials = row.ready ? fmt(row.n_complete) + " complete" : "not run";
+            return `<tr>
+            <td>${label}</td>
+            <td>${trials}</td>
             <td>${row.best_mae != null ? fmt(row.best_mae) + " MW" : "—"}</td>
-          </tr>`).join("")
+          </tr>`;
+          }).join("")
         + "</tbody>";
     }
 

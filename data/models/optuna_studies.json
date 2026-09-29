@@ -1,0 +1,42 @@
+{
+  "short": {
+    "product": "short",
+    "ready": false,
+    "n_trials": 0,
+    "n_complete": 0,
+    "best_mae": null,
+    "best_params": null
+  },
+  "medium": {
+    "product": "medium",
+    "study_name": "medium_mae",
+    "ready": true,
+    "n_trials": 50,
+    "n_complete": 50,
+    "best_mae": 879.3552690481054,
+    "best_params": {
+      "colsample_bytree": 0.6385450911486689,
+      "learning_rate": 0.022965408930055223,
+      "min_child_samples": 61,
+      "n_estimators": 450,
+      "num_leaves": 19,
+      "subsample": 0.781673112232677
+    }
+  },
+  "next_hour": {
+    "product": "next_hour",
+    "study_name": "next_hour_mae",
+    "ready": true,
+    "n_trials": 20,
+    "n_complete": 20,
+    "best_mae": 264.4143529835632,
+    "best_params": {
+      "colsample_bytree": 0.9579950564911175,
+      "learning_rate": 0.03982989749645549,
+      "min_child_samples": 50,
+      "n_estimators": 500,
+      "num_leaves": 94,
+      "subsample": 0.7114944926320207
+    }
+  }
+}

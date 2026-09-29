@@ -13,7 +13,12 @@ def test_model_lab_payload_lists_three_packs():
     assert week["holdout_mae"] is not None
     day = next(row for row in out["packs"] if row["id"] == "day")
     assert day["tuned"] is False
-    assert {row["product"] for row in out["optuna"]} == {"short", "medium"}
+    studies = {row["product"]: row for row in out["optuna"]}
+    assert set(studies) == {"next_hour", "short", "medium"}
+    assert studies["medium"]["ready"] is True
+    assert studies["medium"]["n_complete"] == 50
+    assert studies["next_hour"]["ready"] is True
+    assert studies["next_hour"]["n_complete"] == 20
 
 
 def test_tracking_links_read_env(monkeypatch):
