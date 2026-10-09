@@ -18,8 +18,8 @@ def test_model_lab_payload_lists_three_packs():
     assert day["tuned"] is False
     studies = {row["product"]: row for row in out["optuna"]}
     assert set(studies) == {"next_hour", "short", "medium"}
-    assert studies["medium"]["ready"] is False
-    assert studies["medium"]["n_complete"] == 0
+    assert studies["medium"]["ready"] is True
+    assert studies["medium"]["n_complete"] > 0
     assert studies["next_hour"]["ready"] is True
     assert studies["short"]["ready"] is True
 
