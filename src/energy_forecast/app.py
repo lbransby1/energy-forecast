@@ -266,7 +266,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: #f7f4ee;
     }
     body { max-width: 1680px; margin: 24px auto; padding: 0 16px 40px; }
-    h1 { font-size: 1.55rem; font-weight: 600; margin-bottom: 0.3rem; }
+    h1 { font-size: 1.55rem; font-weight: 600; margin-bottom: 0.15rem; }
+    .source { margin: 0 0 10px; font-size: 0.92rem; }
+    .source a { color: #5c5c5c; }
     h2 { font-size: 1.15rem; margin: 0; }
     .muted { color: #5c5c5c; font-size: 0.92rem; }
     .lede { max-width: 70rem; margin: 0 0 12px; line-height: 1.45; }
@@ -338,6 +340,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>Grid Demand UK</h1>
+  <p class="source"><a href="https://github.com/lbransby1/energy-forecast">GitHub</a></p>
   <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. Three&nbsp;views of the forecast (week, day, half-hour). Scores and checks sit in dropdowns under each chart. Model architecture, the data pipeline, and SHAP have their own tabs. The capture loop issues due forecasts on its own. The project is complete. Times are UK. The black line is only drawn after each half-hour has ended.</p>
   <p class="key" aria-label="Chart colour key">
     <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>

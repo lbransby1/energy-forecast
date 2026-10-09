@@ -17,6 +17,7 @@ def test_dashboard_html():
     response = client.get("/")
     assert response.status_code == 200
     assert "Grid Demand UK" in response.text
+    assert 'href="https://github.com/lbransby1/energy-forecast"' in response.text
     assert "Three&nbsp;views" in response.text
     assert "Typical size of the miss" in response.text
     assert "What the scores mean" in response.text
