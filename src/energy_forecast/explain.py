@@ -227,7 +227,7 @@ _DASHBOARD_PACKS = (
         "loader": load_hour_models,
         "how": (
             "ERA5 weather plus the last two published INDO prints (lag_1, lag_2). "
-            "Issued every half-hour. Skipped if last INDO is older than 90 minutes. "
+            "Issued every half-hour. Skipped unless lag_1 and lag_2 are the latest two INDO prints (and not older than 90 minutes). "
             "Mean tree, then P10/P90 quantile trees on that mean."
         ),
     },

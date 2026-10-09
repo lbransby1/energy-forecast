@@ -7,6 +7,12 @@ services:
       LIVE_TOKEN: ""
       WEEK_REISSUE_PASSWORD: "change-me"
       EF_SKIP_CAPTURE: "0"
+      DRIFT_EMAIL_TO: "${DRIFT_EMAIL_TO:-}"
+      DRIFT_EMAIL_FROM: "${DRIFT_EMAIL_FROM:-}"
+      DRIFT_SMTP_HOST: "${DRIFT_SMTP_HOST:-}"
+      DRIFT_SMTP_PORT: "${DRIFT_SMTP_PORT:-587}"
+      DRIFT_SMTP_USER: "${DRIFT_SMTP_USER:-}"
+      DRIFT_SMTP_PASSWORD: "${DRIFT_SMTP_PASSWORD:-}"
     volumes:
       - ./data/live:/app/data/live
       - ./data/processed:/app/data/processed

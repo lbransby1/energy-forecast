@@ -14,6 +14,9 @@ def test_model_lab_payload_lists_three_packs():
     assert week["ready"] is True
     assert week["tuned"] is True
     assert week["holdout_mae"] is not None
+    hour = next(row for row in out["packs"] if row["id"] == "hour")
+    assert hour["tuned"] is True
+    assert hour["holdout_mae"] is not None
     day = next(row for row in out["packs"] if row["id"] == "day")
     assert day["tuned"] is False
     studies = {row["product"]: row for row in out["optuna"]}
@@ -22,6 +25,16 @@ def test_model_lab_payload_lists_three_packs():
     assert studies["medium"]["n_complete"] > 0
     assert studies["next_hour"]["ready"] is True
     assert studies["short"]["ready"] is True
+
+
+def test_hour_pack_uses_optuna_tree_settings():
+    from energy_forecast.model import HOUR_N_ESTIMATORS, LGB_HOUR, _role_tree_settings
+
+    params, trees = _role_tree_settings("next_hour", 400)
+    assert trees == HOUR_N_ESTIMATORS == 500
+    assert params["num_leaves"] == LGB_HOUR["num_leaves"] == 92
+    week_params, week_trees = _role_tree_settings("week", 400)
+    assert week_trees != trees
 
 
 def test_tune_products_cover_all_three_packs():

@@ -14,7 +14,7 @@ PACKS = (
         "label": "Next 30 minutes",
         "dir": DATA_MODELS_HOUR,
         "search": "next_hour",
-        "note": "ERA5 weather and lag_1 / lag_2. No Optuna winner wired in yet.",
+        "note": "ERA5 weather and lag_1 / lag_2. Optuna next_hour winner (500 trees). Skipped if those lags are missing or stale.",
     },
     {
         "id": "day",
@@ -46,7 +46,7 @@ def _metric_map(model_dir: Path) -> dict[str, float]:
         frame = pd.read_csv(path)
         for _, row in frame.iterrows():
             name = str(row.get("metric", ""))
-            if name in {"mae", "coverage_80", "interval_scale"}:
+            if name in {"mae", "rmse", "bias", "wrmsse", "coverage_80", "interval_width", "interval_scale"}:
                 out[name] = float(row["value"])
     except Exception:  # noqa: BLE001
         return {}
@@ -67,7 +67,11 @@ def _pack_card(spec: dict) -> dict:
         "n_estimators": None,
         "n_holdout": None,
         "holdout_mae": None,
+        "holdout_rmse": None,
+        "holdout_bias": None,
+        "holdout_wrmsse": None,
         "holdout_coverage": None,
+        "holdout_width": None,
         "role": None,
     }
     if not meta_path.exists():
@@ -86,7 +90,11 @@ def _pack_card(spec: dict) -> dict:
         "n_estimators": meta.get("n_estimators"),
         "n_holdout": meta.get("n_holdout"),
         "holdout_mae": metrics.get("mae"),
+        "holdout_rmse": metrics.get("rmse"),
+        "holdout_bias": metrics.get("bias"),
+        "holdout_wrmsse": metrics.get("wrmsse"),
         "holdout_coverage": metrics.get("coverage_80"),
+        "holdout_width": metrics.get("interval_width"),
         "role": meta.get("role"),
         "n_train": meta.get("n_train"),
         "max_lead_hours": meta.get("max_lead_hours"),

@@ -421,6 +421,8 @@ def run_pack(
         scored = scored.copy()
         scored["demand_lag_1"] = last_indo_mw
         scored["demand_lag_2"] = prev_indo_mw
+        if scored["demand_lag_1"].isna().any() or scored["demand_lag_2"].isna().any():
+            raise RuntimeError("hour pack will not predict without demand_lag_1 and demand_lag_2")
         predicted = predict_quantiles(scored, models)
     else:
         observed = featured.dropna(subset=["demand_mw"]) if "demand_mw" in featured.columns else featured.iloc[0:0]
@@ -455,22 +457,32 @@ def require_live_indo_lags() -> tuple[pd.Timestamp, float, float]:
     """Latest published Insights INDO as lag_1, previous print as lag_2.
 
     Raises if Insights has nothing recent enough for a 30-minute call.
+    Two distinct prints are required — the hour pack must not invent lag_2.
     """
     end = date.today()
     start = end - timedelta(days=1)
     indo = fetch_indo(start.isoformat(), end.isoformat())
     if indo.empty:
         raise RuntimeError("Insights INDO returned no rows for short lags")
-    indo = indo.sort_values("timestamp")
+    indo = indo.dropna(subset=["demand_mw"]).sort_values("timestamp")
+    if len(indo) < 2:
+        raise RuntimeError("Insights INDO has fewer than two prints; not issuing 30-minute call")
     last = indo.iloc[-1]
-    prev = indo.iloc[-2] if len(indo) >= 2 else last
+    prev = indo.iloc[-2]
     last_ts = pd.to_datetime(last["timestamp"], utc=True)
+    prev_ts = pd.to_datetime(prev["timestamp"], utc=True)
+    if last_ts == prev_ts:
+        raise RuntimeError("Insights INDO last two prints share a timestamp; not issuing 30-minute call")
+    last_mw = float(last["demand_mw"])
+    prev_mw = float(prev["demand_mw"])
+    if not np.isfinite(last_mw) or not np.isfinite(prev_mw):
+        raise RuntimeError("Insights INDO lags are not finite; not issuing 30-minute call")
     age = (pd.Timestamp.now(tz="UTC") - last_ts).total_seconds() / 60.0
     if age > LIVE_INDO_MAX_AGE_MINUTES:
         raise RuntimeError(
             f"latest INDO is {age:.0f} min old ({last_ts.isoformat()}); not issuing 30-minute call"
         )
-    return last_ts, float(last["demand_mw"]), float(prev["demand_mw"])
+    return last_ts, last_mw, prev_mw
 
 
 _FROZEN_COLUMNS = (
@@ -696,10 +708,10 @@ def _persist_short_lags(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.sort_values(["region_id", "timestamp"]).copy()
     for _, group in out.groupby("region_id", sort=False):
         observed = group.dropna(subset=["demand_mw"])
-        if observed.empty:
+        if len(observed) < 2:
             continue
         last = float(observed["demand_mw"].iloc[-1])
-        prev = float(observed["demand_mw"].iloc[-2]) if len(observed) >= 2 else last
+        prev = float(observed["demand_mw"].iloc[-2])
         future_idx = group.index[group["demand_mw"].isna()]
         if future_idx.empty:
             continue

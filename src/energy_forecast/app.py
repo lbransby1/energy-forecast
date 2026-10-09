@@ -124,6 +124,17 @@ def shap() -> JSONResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/drift")
+def drift() -> JSONResponse:
+    """Last live-vs-holdout check. Capture-loop file only — no weather APIs."""
+    try:
+        from energy_forecast.drift import drift_payload
+
+        return JSONResponse(drift_payload(), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/board")
 def board() -> dict:
     try:
@@ -285,11 +296,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .shap-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; align-items: start; margin-top: 14px; }
     .shap-row .models-pack { margin: 0; min-width: 0; }
     .shap-row .lab-packs { font-size: 0.75rem; }
+    .pipeline { width: 100%; max-width: none; }
+    .pipeline .panel { margin: 14px 0; width: 100%; box-sizing: border-box; }
+    .pipeline h2 { margin-bottom: 6px; }
+    .pipeline ol { margin: 8px 0 0; padding-left: 1.2rem; line-height: 1.45; color: #444; }
+    .pipeline li { margin: 6px 0; }
     @media (max-width: 1100px) {
       .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30"; }
       .shap-row { grid-template-columns: 1fr; }
     }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
+    .panel.n30 .head { flex-wrap: nowrap; align-items: center; }
+    .panel.n30 .head h2 { margin-right: auto; }
+    .panel.n30 .links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px 12px; text-align: right; }
+    .panel.n30 .links a { margin-right: 0; }
     .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 8px; }
     .score-label { font-size: 0.8rem; font-weight: 600; color: #5c5c5c; margin: 10px 0 0; }
     .cards.holdout .card { background: #faf8f4; }
@@ -309,12 +329,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     table.audit { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }
     .models-pack h3 { margin: 0 0 6px; font-size: 1.05rem; }
     button.active-view { font-weight: 600; }
+    .chart-nav { display: flex; justify-content: space-between; align-items: center; gap: 10px; width: 100%; margin: 8px 0 4px; }
+    .panel .chart-nav button { font-size: 0.88rem; padding: 5px 14px; margin: 0; }
+    .panel .chart-nav button:disabled { opacity: 0.4; cursor: default; }
+    .chart-nav-range { text-align: center; color: #5c5c5c; font-size: 0.88rem; margin: 8px 0 0; }
     @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <h1>Grid Demand UK</h1>
-  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. Three&nbsp;views of the forecast (week, day, half-hour). Scores, how this freeze did, and the half-hour INDO lag check sit in dropdowns under each chart. Training and SHAP live on the models tab. The project is complete. Times are UK. The black line is only drawn after each half-hour has ended.</p>
+  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. Three&nbsp;views of the forecast (week, day, half-hour). Scores and checks sit in dropdowns under each chart. Model architecture, the data pipeline, and SHAP have their own tabs. The capture loop issues due forecasts on its own. The project is complete. Times are UK. The black line is only drawn after each half-hour has ended.</p>
   <p class="key" aria-label="Chart colour key">
     <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>
     <span><i class="swatch red"></i> Red — the central forecast (most likely demand)</span>
@@ -331,6 +355,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <dd>How many half-hours already have an official number, so they can be scored. “Waiting” means none yet. On the holdout row it is the size of that train window.</dd>
       <dt>MAE</dt>
       <dd>Typical size of the miss, in megawatts. Average of how far the red line was from the black line. Lower is better.</dd>
+      <dt>RMSE</dt>
+      <dd>Like MAE, but larger misses count more. Square root of the mean squared miss, in megawatts.</dd>
       <dt>WRMSSE</dt>
       <dd>Error compared with copying last week. <b>1.0</b> = as good as paste-last-week. Below 1 beats that. Above 1 is worse.</dd>
       <dt>Coverage</dt>
@@ -343,9 +369,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </details>
   <p>
     <button type="button" id="view-live" class="active-view">Live board</button>
-    <button type="button" id="view-models">How the models work</button>
-    <button type="button" id="reload">Reload board</button>
-    <button type="button" id="capture">Issue due presets</button>
+    <button type="button" id="view-models">Model Architecture</button>
+    <button type="button" id="view-pipeline">Data Pipeline and Maintenance</button>
     <span class="muted" id="note">Loading board…</span>
   </p>
 
@@ -367,6 +392,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <p class="explain">This chart is the last two days of last week (Saturday and Sunday), then this week from Monday, in time order. That keeps this week’s half-hours readable. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Open <b>Scores</b> for this freeze vs holdout.</p>
     <button type="button" data-preset="week">Re-issue week (password)</button>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
+    <p class="chart-nav-range" id="week-range">This week</p>
+    <p class="chart-nav">
+      <button type="button" data-shift="week" data-dir="-1">Earlier</button>
+      <button type="button" data-shift="week" data-dir="0">Today</button>
+      <button type="button" data-shift="week" data-dir="1">Later</button>
+    </p>
     <details class="fold">
       <summary>Scores</summary>
       <p class="explain"><b>This freeze</b> scores only hours of this week that already have a black line. <b>Holdout</b> is the last train, not this week.</p>
@@ -398,6 +429,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p class="explain">The left side is yesterday’s London calendar day, from the first stored half-hour until midnight. A late freeze (for example issued at 9am) still stops at midnight; it does not run into today. From midnight the bright lines are today’s forecast. Open <b>Scores</b> for today vs holdout.</p>
       <button type="button" data-preset="day">Re-issue day</button>
       <div class="chart-wrap half"><canvas id="day"></canvas></div>
+      <p class="chart-nav-range" id="day-range">Today</p>
+      <p class="chart-nav">
+        <button type="button" data-shift="day" data-dir="-1">Earlier</button>
+        <button type="button" data-shift="day" data-dir="0">Today</button>
+        <button type="button" data-shift="day" data-dir="1">Later</button>
+      </p>
       <details class="fold">
         <summary>Scores</summary>
         <p class="explain"><b>This freeze</b> is today. <b>Holdout</b> is the last train, not this morning.</p>
@@ -415,19 +452,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </section>
   <section class="panel n30">
       <div class="head">
-        <div>
-          <h2>Next 30 minutes</h2>
-          <p class="muted" id="n30-note">A new guess every half-hour.</p>
-        </div>
+        <h2>Next 30 minutes</h2>
         <div class="links">
           <a href="/download/next30?which=current">Forecast CSV</a>
           <a href="/download/next30/frozen?which=current">Frozen inputs</a>
           <a href="/inputs/next30">Input check JSON</a>
         </div>
       </div>
+      <p class="muted" id="n30-note">A new guess every half-hour.</p>
       <p class="explain">This chart is the last six hours, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Pale red is what was written at the time. Dots are the live guess still waiting. Open <b>Scores</b> for this freeze vs holdout, and <b>INDO lag check</b> for the demand readings the model used.</p>
       <button type="button" data-preset="next30">Re-issue next 30</button>
       <div class="chart-wrap half"><canvas id="next30"></canvas></div>
+      <p class="chart-nav-range" id="n30-range">Last six hours</p>
+      <p class="chart-nav">
+        <button type="button" data-shift="next30" data-dir="-1">Earlier</button>
+        <button type="button" data-shift="next30" data-dir="0">Today</button>
+        <button type="button" data-shift="next30" data-dir="1">Later</button>
+      </p>
       <details class="fold">
         <summary>Scores</summary>
         <p class="explain"><b>This freeze</b> is those finished half-hours. <b>Holdout</b> is the last train.</p>
@@ -469,8 +510,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p class="muted" id="lab-note">Holdout scores from the last train, not today’s board.</p>
         </div>
       </div>
-      <p class="explain"><b>Holdout</b> is the last eight weeks used when the pack was fit. <b>This freeze MAE</b> is the live chart score — a different sample. Trial counts come from the last exported Optuna snapshot shipped with the models. A Weights &amp; Biases link appears when <code>WANDB_PROJECT_URL</code> is set on the server.</p>
-      <p class="links" id="lab-links"></p>
+      <p class="explain"><b>Holdout</b> is the last eight weeks used when the pack was fit. <b>This freeze MAE</b> is the live chart score — a different sample. Trial counts come from the last exported Optuna snapshot shipped with the models.</p>
       <table class="lab-packs" id="lab-packs"></table>
       <table class="lab-packs" id="lab-optuna"></table>
     </section>
@@ -500,10 +540,55 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="pipeline-view" class="pipeline" hidden>
+    <p class="explain">The live site never trains. It <b>reads</b> committed trees and a growing parquet board. Weather and Insights run on the capture loop (:10 / :40 London), in a worker thread, so this page stays fast.</p>
+    <section class="panel">
+      <h2>1. Ingestion</h2>
+      <ol>
+        <li><b>Historic demand</b> — NESO National Demand CSVs under <code>data/raw</code>, baked into the Docker image.</li>
+        <li><b>Live actuals</b> — Elexon Insights <b>INDO</b>, no API key. Today’s file is incomplete all morning, so it is refetched through the day. Writes are atomic (temp file + replace) and locked.</li>
+        <li><b>Weather</b> — Open-Meteo. Hour pack uses ERA5. Day and week use Previous Runs (what would have been on the forecast at issue) plus the operational forecast for the live horizon. 429/502/503/504 retry with backoff.</li>
+      </ol>
+    </section>
+    <section class="panel">
+      <h2>2. Processing</h2>
+      <ol>
+        <li>Everything is aligned to <b>Europe/London settlement periods</b>, including DST 46/50-period days. Timestamps are period starts. INDO for period T exists only after T+30&nbsp;min.</li>
+        <li><code>features.py</code> builds calendar and UK holidays, HDD/CDD at 15.5°C, weather trajectory (past rolls and forward 12h/24h on the issued path), and the lag set for that pack.</li>
+        <li>Caches land in <code>data/processed</code> (gitignored volume). Issued rows and frozen feature snapshots land in <code>data/live</code>.</li>
+      </ol>
+    </section>
+    <section class="panel">
+      <h2>3. Issue, freeze, score</h2>
+      <ol>
+        <li>The capture loop writes a forecast <b>first</b>. Day freezes at midnight London. Week freezes Monday 00:00 (password to overwrite). Next-30 runs every half-hour; it is skipped unless lag_1 and lag_2 are the latest two INDO prints (and not older than 90 minutes). Issues without those lags are dropped from the board and scores.</li>
+        <li>The freeze parquet is the audit trail: weather, lags, last INDO at issue time. Later ERA5 cannot rewrite what the model saw.</li>
+        <li>When Insights publishes INDO for that half-hour, it is joined onto the board. MAE, coverage, bias, width, and WRMSSE are computed here — not from the holdout table.</li>
+      </ol>
+    </section>
+    <section class="panel">
+      <h2>4. API</h2>
+      <ol>
+        <li><code>GET /</code> is this HTML. <code>GET /board</code>, <code>GET /shap</code>, and <code>GET /drift</code> read local parquet, trees, and <code>drift.json</code> only — no Open-Meteo, no Insights.</li>
+        <li><code>POST /capture</code> is the slow path (the loop already calls it). Per-chart re-issue still hits <code>POST /capture/{preset}</code>; week needs the password header.</li>
+        <li>CSV downloads are the current and previous freeze. <code>GET /health</code> is the Railway check.</li>
+      </ol>
+    </section>
+    <section class="panel">
+      <h2>5. Drift mail</h2>
+      <p class="explain">After each capture tick the live MAE and coverage for this freeze are compared with the last-train holdout. If live MAE is at least 1.5× holdout, or coverage falls below 55%, with enough scored half-hours, an email can go out. The same pack and kind wait 12 hours before mailing again.</p>
+      <p class="muted" id="drift-note">Loading drift status…</p>
+      <table class="lab-packs" id="drift-packs"></table>
+    </section>
+  </div>
+
   <script src="/chart.js"></script>
   <script>
     const fmt = (n, d=0) => n == null || Number.isNaN(n) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d});
     const charts = {};
+    let lastBoard = null;
+    const viewShift = { week: 0, day: 0, next30: 0 };
+    const N30_WINDOW_MS = 6 * 3600 * 1000;
     Chart.defaults.font.family = '"Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif';
 
     function londonParts(ts) {
@@ -588,14 +673,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return ((lab && lab.packs) || []).find((row) => row.id === id) || {};
     }
 
-    function cards(el, metrics, extra) {
+    function cards(el, metrics, extra, empty) {
       const m = metrics || {};
+      const miss = empty || "waiting";
       el.innerHTML = `
         ${extra || ""}
         <div class="card" title="How many half-hours already have an official number, so they can be scored."><span class="muted">n</span><b>${fmt(m.n)}</b></div>
-        <div class="card" title="Typical size of the miss, in megawatts. Lower is better."><span class="muted">MAE</span><b>${m.mae != null ? fmt(m.mae) + " MW" : "waiting"}</b></div>
+        <div class="card" title="Typical size of the miss, in megawatts. Lower is better."><span class="muted">MAE</span><b>${m.mae != null ? fmt(m.mae) + " MW" : miss}</b></div>
+        <div class="card" title="Like MAE, but larger misses count more."><span class="muted">RMSE</span><b>${m.rmse != null ? fmt(m.rmse) + " MW" : "—"}</b></div>
         <div class="card" title="Compared with copying last week. 1.0 = copy last week. Below 1 is better."><span class="muted">WRMSSE</span><b>${m.wrmsse != null ? Number(m.wrmsse).toFixed(2) : "—"}</b></div>
-        <div class="card" title="How often the black line landed between the two blue lines. About 80% is the aim."><span class="muted">Coverage</span><b>${m.coverage_80 != null ? (100*m.coverage_80).toFixed(0) + "%" : "waiting"}</b></div>
+        <div class="card" title="How often the black line landed between the two blue lines. About 80% is the aim."><span class="muted">Coverage</span><b>${m.coverage_80 != null ? (100*m.coverage_80).toFixed(0) + "%" : miss}</b></div>
         <div class="card" title="Actual minus guess. Negative means the red line was too high."><span class="muted">Bias</span><b>${m.bias != null ? fmt(m.bias) + " MW" : "—"}</b></div>
         <div class="card" title="Average gap between the blue lines over the whole issued forecast, including hours still to come."><span class="muted">Width</span><b>${m.interval_width != null ? fmt(m.interval_width) + " MW" : "—"}</b></div>`;
     }
@@ -603,10 +690,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function holdoutCards(el, pack) {
       if (!el) return;
       const m = pack || {};
-      el.innerHTML = `
-        <div class="card" title="Half-hours in the last train holdout. Not this freeze."><span class="muted">n</span><b>${m.n_holdout != null ? fmt(m.n_holdout) : "—"}</b></div>
-        <div class="card" title="Holdout MAE from the last train. A different sample from the freeze cards above."><span class="muted">MAE</span><b>${m.holdout_mae != null ? fmt(m.holdout_mae) + " MW" : "—"}</b></div>
-        <div class="card" title="Holdout share of actuals inside the P10–P90 band. About 80% is the aim."><span class="muted">Coverage</span><b>${m.holdout_coverage != null ? (100 * m.holdout_coverage).toFixed(0) + "%" : "—"}</b></div>`;
+      cards(el, {
+        n: m.n_holdout,
+        mae: m.holdout_mae,
+        rmse: m.holdout_rmse,
+        wrmsse: m.holdout_wrmsse,
+        coverage_80: m.holdout_coverage,
+        bias: m.holdout_bias,
+        interval_width: m.holdout_width,
+      }, "", "—");
     }
 
     function lineChart(id, labels, datasets, title, mode, yTitle) {
@@ -737,7 +829,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             + ((week.previous && week.previous.issued_at)
               ? " · left = Saturday–Sunday vs actual"
               : " · left = Saturday–Sunday actual only"))
-          : "No week forecast yet — it is written Monday midnight UK, or click Issue due presets.";
+          : "No week forecast yet — it is written Monday midnight UK.";
       const yestFan = day.previous && day.previous.issued_at;
       const yestActuals = day.previous_actuals && day.previous_actuals.length;
       document.getElementById("day-note").textContent =
@@ -748,26 +840,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               : (yestActuals
                 ? " · left = yesterday actual until midnight"
                 : " · no yesterday freeze in range")))
-          : "No day forecast yet — it is written at midnight UK, or click Issue due presets.";
-      const dayTitle = (yestFan || yestActuals)
-        ? "Yesterday until midnight, then today’s forecast"
-        : "Today’s forecast";
+          : "No day forecast yet — it is written at midnight UK.";
       document.getElementById("n30-note").textContent = live.timestamp
         ? ("Guessing " + london(live.timestamp) + " · written " + london(live.issued_at)
           + " · most likely " + fmt(live.p50) + " MW")
         : "Waiting for the first half-hour guess.";
       const lab = board.lab || {};
-      cards(document.getElementById("week-cards"), week.current && week.current.metrics);
       holdoutCards(document.getElementById("week-holdout"), packById(lab, "week"));
-      cards(document.getElementById("day-cards"), day.current && day.current.metrics,
-        (day.previous && day.previous.metrics && day.previous.issued_at)
-          ? `<div class="card" title="Yesterday’s freeze: typical miss once the day had finished."><span class="muted">Yesterday MAE</span><b>${day.previous.metrics.mae != null ? fmt(day.previous.metrics.mae) + " MW" : "—"}</b></div>`
-          : "");
       holdoutCards(document.getElementById("day-holdout"), packById(lab, "day"));
-      cards(document.getElementById("n30-cards"), n30.metrics, live.timestamp
-        ? `<div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
-           <div class="card" title="The current red-line guess for that half-hour, in megawatts."><span class="muted">Live P50</span><b>${fmt(live.p50)} MW</b></div>`
-        : "");
       holdoutCards(document.getElementById("n30-holdout"), packById(lab, "hour"));
       const inp = n30.inputs || {};
       const issues = inp.issues || [];
@@ -779,7 +859,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           + " at " + london(inp.last_indo_timestamp)
           + " (" + age + ") · lag_1 " + fmt(inp.demand_lag_1) + " · lag_2 " + fmt(inp.demand_lag_2)
           + " · T " + (inp.temperature_2m != null ? Number(inp.temperature_2m).toFixed(1) + "°C" : "—"))
-        : (issues.length ? issues.join(" · ") : "No frozen 30-minute inputs yet — click Issue due presets.");
+        : (issues.length ? issues.join(" · ") : "No frozen 30-minute inputs yet — waiting for the capture loop.");
       const audit = (n30.audit && n30.audit.rows) || [];
       const auditEl = document.getElementById("n30-audit");
       if (!audit.length) {
@@ -793,9 +873,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <td>${fmt(r.p50)}</td><td>${fmt(r.actual_mw)}</td><td>${mark}</td></tr>`;
           }).join("") + "</tbody>";
       }
-      drawWindow("week", week.previous, week.previous_actuals, week.current, "Saturday–Sunday, then this week’s forecast", "week", "Sat–Sun", stampMs(week.current && week.current.window_start));
-      drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
-      drawNext30(n30.history || [], live);
+      lastBoard = board;
+      drawLiveCharts(board);
       drawEval(board.eval || {});
       drawLab(lab, {
         hour: n30.metrics,
@@ -899,15 +978,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function showLive() {
       document.getElementById("live-view").hidden = false;
       document.getElementById("models-view").hidden = true;
+      document.getElementById("pipeline-view").hidden = true;
       document.getElementById("view-live").classList.add("active-view");
       document.getElementById("view-models").classList.remove("active-view");
+      document.getElementById("view-pipeline").classList.remove("active-view");
     }
 
     async function showModels() {
       document.getElementById("live-view").hidden = true;
       document.getElementById("models-view").hidden = false;
+      document.getElementById("pipeline-view").hidden = true;
       document.getElementById("view-live").classList.remove("active-view");
       document.getElementById("view-models").classList.add("active-view");
+      document.getElementById("view-pipeline").classList.remove("active-view");
       const note = document.getElementById("note");
       note.textContent = "Loading SHAP…";
       try {
@@ -918,19 +1001,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    async function showPipeline() {
+      document.getElementById("live-view").hidden = true;
+      document.getElementById("models-view").hidden = true;
+      document.getElementById("pipeline-view").hidden = false;
+      document.getElementById("view-live").classList.remove("active-view");
+      document.getElementById("view-models").classList.remove("active-view");
+      document.getElementById("view-pipeline").classList.add("active-view");
+      const note = document.getElementById("note");
+      note.textContent = "";
+      try {
+        await loadDrift();
+      } catch (err) {
+        note.textContent = String(err);
+      }
+    }
+
+    async function loadDrift() {
+      const body = await readJson(await fetch("/drift"));
+      const el = document.getElementById("drift-note");
+      el.textContent = body.note || "";
+      const table = document.getElementById("drift-packs");
+      const packs = body.packs || [];
+      if (!packs.length) {
+        table.innerHTML = "";
+        return;
+      }
+      table.innerHTML = "<thead><tr><th>Pack</th><th>n</th><th>Live MAE</th><th>Holdout MAE</th><th>Ratio</th><th>Live cov</th></tr></thead><tbody>"
+        + packs.map((row) => `<tr>
+            <td>${row.label || row.id}</td>
+            <td>${fmt(row.n)}</td>
+            <td>${row.live_mae != null ? fmt(row.live_mae) + " MW" : "—"}</td>
+            <td>${row.holdout_mae != null ? fmt(row.holdout_mae) + " MW" : "—"}</td>
+            <td>${row.mae_ratio != null ? Number(row.mae_ratio).toFixed(2) : "—"}</td>
+            <td>${row.live_coverage != null ? (100 * row.live_coverage).toFixed(0) + "%" : "—"}</td>
+          </tr>`).join("")
+        + "</tbody>";
+    }
+
     function drawLab(lab, liveByPack) {
       const packs = lab.packs || [];
       const optuna = lab.optuna || [];
-      const tracking = lab.tracking || {};
       const live = liveByPack || {};
       document.getElementById("lab-note").textContent = packs.length
         ? (packs.length + " packs on this box")
         : "No saved packs on this box.";
-      const links = [];
-      if (tracking.notebook) links.push(`<a href="${tracking.notebook}">Optuna notebook</a>`);
-      if (tracking.wandb) links.push(`<a href="${tracking.wandb}">Weights &amp; Biases</a>`);
-      else links.push('<span class="muted" title="Set WANDB_PROJECT_URL on the server to show a live W&amp;B project.">W&amp;B — set WANDB_PROJECT_URL</span>');
-      document.getElementById("lab-links").innerHTML = links.join(" · ");
       const packTable = document.getElementById("lab-packs");
       packTable.innerHTML = "<thead><tr><th>Pack</th><th>Holdout MAE</th><th>This freeze MAE</th><th>Holdout cov</th></tr></thead><tbody>"
         + packs.map((row) => {
@@ -958,13 +1073,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         + "</tbody>";
     }
 
-    function drawNext30(hist, live) {
+    function drawNext30(hist, live, offset) {
       const liveTs = live && live.timestamp;
-      const rows = hist.slice();
-      if (liveTs && !rows.some((row) => row.timestamp === liveTs)) rows.push(live);
-      rows.sort((a, b) => (stampMs(a.timestamp) || 0) - (stampMs(b.timestamp) || 0));
+      const all = hist.slice();
+      if (liveTs && !all.some((row) => row.timestamp === liveTs)) all.push(live);
+      all.sort((a, b) => (stampMs(a.timestamp) || 0) - (stampMs(b.timestamp) || 0));
+      const latest = stampMs((live && live.timestamp) || (all.length ? all[all.length - 1].timestamp : null));
+      const endMs = latest == null ? null : latest - (offset || 0) * N30_WINDOW_MS;
+      const startMs = endMs == null ? null : endMs - N30_WINDOW_MS;
+      const rows = endMs == null ? all : all.filter((row) => {
+        const ms = stampMs(row.timestamp);
+        return ms != null && ms > startMs && ms <= endMs;
+      });
+      const showLive = offset === 0;
       const labels = rows.map((row) => row.timestamp);
-      const liveDot = (key) => rows.map((row) => row.timestamp === liveTs ? row[key] : null);
+      const liveDot = (key) => rows.map((row) => (showLive && row.timestamp === liveTs) ? row[key] : null);
       lineChart("next30", labels, [
         { label: "Actual", data: rows.map((row) => row.actual_mw), borderColor: "#111", pointRadius: 0, borderWidth: 2, spanGaps: true },
         { label: "Guess then", data: rows.map((row) => row.p50), borderColor: "#e0b49a", pointRadius: 0, borderWidth: 1.5, spanGaps: true },
@@ -973,25 +1096,105 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         { label: "Live low", data: liveDot("p10"), borderColor: "#9bb8d3", pointRadius: 4, borderWidth: 1.5, showLine: false },
         { label: "Live guess", data: liveDot("p50"), borderColor: "#c45c26", pointRadius: 6, borderWidth: 2, showLine: false },
         { label: "Live high", data: liveDot("p90"), borderColor: "#9bb8d3", pointRadius: 4, borderWidth: 1.5, showLine: false },
-      ], "Pale lines = guesses already written. Dots = the half-hour still waiting for the official number.", "next30");
+      ], offset ? "Issued guesses in this six-hour window" : "Pale lines = guesses already written. Dots = the half-hour still waiting for the official number.", "next30");
+      return rows;
     }
 
-    async function runCapture(force) {
-      const note = document.getElementById("note");
-      note.textContent = force ? "Re-issuing…" : "Running due packs…";
-      try {
-        const res = await fetch("/capture?force=" + (force ? "true" : "false"), { method: "POST" });
-        const body = await readJson(res);
-        if (!res.ok) {
-          note.textContent = body.detail || "failed";
-        } else if (body.next30 && body.next30.skipped && body.next30.reason) {
-          note.textContent = "Skipped 30-minute call: " + body.next30.reason;
-        } else {
-          note.textContent = "Updated";
-        }
-        await load();
-      } catch (err) { note.textContent = String(err); }
+    function sliceMetrics(rows) {
+      const scored = (rows || []).filter((row) => row.actual_mw != null && row.p50 != null);
+      const n = scored.length;
+      if (!n) return { n: 0, mae: null, rmse: null, coverage_80: null, bias: null, interval_width: null, wrmsse: null };
+      const err = scored.map((row) => row.actual_mw - row.p50);
+      const mae = err.reduce((a, b) => a + Math.abs(b), 0) / n;
+      const rmse = Math.sqrt(err.reduce((a, b) => a + b * b, 0) / n);
+      const bias = err.reduce((a, b) => a + b, 0) / n;
+      const band = scored.filter((row) => row.p10 != null && row.p90 != null);
+      const coverage_80 = band.length
+        ? band.filter((row) => row.actual_mw >= row.p10 && row.actual_mw <= row.p90).length / band.length
+        : null;
+      const widths = (rows || []).filter((row) => row.p10 != null && row.p90 != null).map((row) => row.p90 - row.p10);
+      const interval_width = widths.length ? widths.reduce((a, b) => a + b, 0) / widths.length : null;
+      return { n, mae, rmse, coverage_80, bias, interval_width, wrmsse: null };
     }
+
+    function setNav(kind, label, offset, max) {
+      const range = document.getElementById(kind === "next30" ? "n30-range" : kind + "-range");
+      if (range) range.textContent = label;
+      document.querySelectorAll(`button[data-shift="${kind}"]`).forEach((btn) => {
+        const dir = Number(btn.dataset.dir);
+        if (dir < 0) btn.disabled = offset >= max;
+        else btn.disabled = offset <= 0;
+      });
+    }
+
+    function drawLiveCharts(board) {
+      if (!board) return;
+      const week = board.week || {};
+      const day = board.day || {};
+      const n30 = board.next30 || {};
+      const live = (n30.current && n30.current[0]) || {};
+      const weekArchives = week.archives || [];
+      const dayArchives = day.archives || [];
+      const weekMax = Math.max(0, weekArchives.length - 1);
+      const dayMax = Math.max(0, dayArchives.length - 1);
+      viewShift.week = Math.min(viewShift.week, weekMax);
+      viewShift.day = Math.min(viewShift.day, dayMax);
+      const hist = n30.history || [];
+      const latest = stampMs(live.timestamp || (hist.length ? hist[hist.length - 1].timestamp : null));
+      const oldest = hist.length ? stampMs(hist[0].timestamp) : latest;
+      const n30Max = (latest != null && oldest != null)
+        ? Math.max(0, Math.ceil((latest - oldest - N30_WINDOW_MS) / N30_WINDOW_MS))
+        : 0;
+      viewShift.next30 = Math.min(viewShift.next30, n30Max);
+
+      if (viewShift.week === 0) {
+        drawWindow("week", week.previous, week.previous_actuals, week.current, "Saturday–Sunday, then this week’s forecast", "week", "Sat–Sun", stampMs(week.current && week.current.window_start));
+        setNav("week", "This week", 0, weekMax);
+        cards(document.getElementById("week-cards"), week.current && week.current.metrics);
+      } else {
+        const win = weekArchives[viewShift.week] || {};
+        drawWindow("week", { rows: [] }, [], win, "Monday freeze vs official numbers", "week", "", stampMs(win.window_start));
+        setNav("week", win.issued_at ? ("Week of " + london(win.window_start || win.issued_at)) : "Earlier week", viewShift.week, weekMax);
+        cards(document.getElementById("week-cards"), win.metrics);
+      }
+
+      if (viewShift.day === 0) {
+        const yestFan = day.previous && day.previous.issued_at;
+        const yestActuals = day.previous_actuals && day.previous_actuals.length;
+        const dayTitle = (yestFan || yestActuals)
+          ? "Yesterday until midnight, then today’s forecast"
+          : "Today’s forecast";
+        drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
+        setNav("day", "Today", 0, dayMax);
+        cards(document.getElementById("day-cards"), day.current && day.current.metrics,
+          (day.previous && day.previous.metrics && day.previous.issued_at)
+            ? `<div class="card" title="Yesterday’s freeze: typical miss once the day had finished."><span class="muted">Yesterday MAE</span><b>${day.previous.metrics.mae != null ? fmt(day.previous.metrics.mae) + " MW" : "—"}</b></div>`
+            : "");
+      } else {
+        const cur = dayArchives[viewShift.day] || {};
+        const prev = dayArchives[viewShift.day + 1] || { rows: [] };
+        drawWindow("day", prev, [], cur, "Issued day freeze vs official numbers", "day", "Previous day", stampMs(cur.window_start));
+        setNav("day", cur.issued_at || cur.window_start ? london(cur.window_start || cur.issued_at) : "Earlier day", viewShift.day, dayMax);
+        cards(document.getElementById("day-cards"), cur.metrics);
+      }
+
+      const shown = drawNext30(hist, live, viewShift.next30);
+      const n30Start = shown.length ? shown[0].timestamp : null;
+      const n30End = shown.length ? shown[shown.length - 1].timestamp : null;
+      setNav("next30",
+        viewShift.next30 === 0 ? "Last six hours"
+          : ((n30Start ? london(n30Start) : "") + " – " + (n30End ? london(n30End) : "")),
+        viewShift.next30, n30Max);
+      if (viewShift.next30 === 0) {
+        cards(document.getElementById("n30-cards"), n30.metrics, live.timestamp
+          ? `<div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
+             <div class="card" title="The current red-line guess for that half-hour, in megawatts."><span class="muted">Live P50</span><b>${fmt(live.p50)} MW</b></div>`
+          : "");
+      } else {
+        cards(document.getElementById("n30-cards"), sliceMetrics(shown));
+      }
+    }
+
     async function reissuePreset(preset) {
       const note = document.getElementById("note");
       const names = { week: "week", day: "day", next30: "next 30 minutes" };
@@ -1018,24 +1221,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         await load();
       } catch (err) { note.textContent = String(err); }
     }
-    document.getElementById("capture").onclick = () => runCapture(false);
-    document.getElementById("reload").onclick = () => reloadBoard();
     document.getElementById("view-live").onclick = () => showLive();
     document.getElementById("view-models").onclick = () => showModels();
+    document.getElementById("view-pipeline").onclick = () => showPipeline();
     document.querySelectorAll("button[data-preset]").forEach((btn) => {
       btn.onclick = () => reissuePreset(btn.dataset.preset);
     });
-
-    async function reloadBoard() {
-      const note = document.getElementById("note");
-      note.textContent = "Refreshing…";
-      try {
-        await load();
-        note.textContent = "";
-      } catch (err) {
-        note.textContent = String(err);
-      }
-    }
+    document.querySelectorAll("button[data-shift]").forEach((btn) => {
+      btn.onclick = () => {
+        const kind = btn.dataset.shift;
+        const dir = Number(btn.dataset.dir);
+        if (dir === 0) viewShift[kind] = 0;
+        else if (dir < 0) viewShift[kind] += 1;
+        else viewShift[kind] = Math.max(0, viewShift[kind] - 1);
+        if (lastBoard) drawLiveCharts(lastBoard);
+      };
+    });
 
     load().then(() => { document.getElementById("note").textContent = ""; }).catch((err) => {
       document.getElementById("note").textContent = String(err);

@@ -233,6 +233,7 @@ def test_next30_live_row_skips_ancient_holes(monkeypatch):
             "p90": [17000.0, 25000.0],
             "actual_mw": [None, None],
             "demand_lag_1": [None, 25790.0],
+            "demand_lag_2": [None, 25600.0],
             "last_indo_mw": [None, 25790.0],
         }
     )
@@ -278,6 +279,9 @@ def test_next30_actuals_sit_at_period_end(monkeypatch):
             "p50": [20000.0],
             "p90": [21000.0],
             "actual_mw": [99999.0],
+            "demand_lag_1": [25000.0],
+            "demand_lag_2": [24900.0],
+            "last_indo_mw": [25000.0],
         }
     )
     payload = _window_payload("next30", window, board, context=context)
@@ -349,6 +353,8 @@ def test_next30_history_is_last_six_hours():
     assert pd.Timestamp("2026-09-29T04:00:00Z") not in stamps
     assert pd.Timestamp("2026-09-29T08:00:00Z") in stamps
     assert pd.Timestamp("2026-09-29T12:00:00Z") in stamps
+    full = _next30_history(next30, live, now, pd.DataFrame(), hours=None)
+    assert pd.Timestamp("2026-09-29T04:00:00Z") in set(pd.to_datetime(full["timestamp"], utc=True))
 
 
 def test_evaluation_tags_outside_band_and_lags():
@@ -363,6 +369,7 @@ def test_evaluation_tags_outside_band_and_lags():
             "p90": [26000.0, 26000.0],
             "actual_mw": [28000.0, 25100.0],
             "demand_lag_1": [20000.0, 25100.0],
+            "demand_lag_2": [19900.0, 25000.0],
             "last_indo_mw": [25000.0, 25100.0],
         }
     )
@@ -391,3 +398,118 @@ def test_width_averages_the_full_issued_fan():
     metrics = preset_metrics(frame, compute_wrmsse=False)
     assert metrics["n"] == 1
     assert metrics["interval_width"] == 250.0
+
+
+def test_next30_missing_lags_are_cut_from_scores():
+    from energy_forecast.live import _preset_frame, evaluation_payload, next30_lags_ok
+
+    board = pd.DataFrame(
+        {
+            "preset": ["next30", "next30", "day"],
+            "timestamp": pd.to_datetime(
+                ["2026-09-28T08:30:00Z", "2026-10-08T10:30:00Z", "2026-10-08T10:00:00Z"]
+            ),
+            "issued_at": pd.to_datetime(
+                ["2026-09-28T08:00:00Z", "2026-10-08T10:00:00Z", "2026-10-08T00:00:00Z"]
+            ),
+            "p10": [19000.0, 24000.0, 24000.0],
+            "p50": [20000.0, 25000.0, 25000.0],
+            "p90": [21000.0, 26000.0, 26000.0],
+            "actual_mw": [28359.0, 25100.0, 25100.0],
+            "demand_lag_1": [None, 25000.0, 25000.0],
+            "demand_lag_2": [None, 24800.0, 24800.0],
+            "last_indo_mw": [None, 25000.0, 25000.0],
+        }
+    )
+    ok = next30_lags_ok(board)
+    assert bool(ok.iloc[0]) is False
+    assert bool(ok.iloc[1]) is True
+    kept = _preset_frame("next30", board)
+    assert len(kept) == 1
+    assert float(kept["p50"].iloc[0]) == 25000.0
+    out = evaluation_payload(board, pd.DataFrame())
+    assert out["by_preset"]["next30"]["scored"] == 1
+    assert out["by_preset"]["next30"]["lags"] == 0
+    assert abs(out["by_preset"]["next30"]["worst"][0]["error_mw"]) < 2000
+
+
+def test_next30_stale_lag_mismatch_is_cut():
+    from energy_forecast.live import next30_lags_ok
+
+    board = pd.DataFrame(
+        {
+            "demand_lag_1": [20000.0],
+            "demand_lag_2": [19800.0],
+            "last_indo_mw": [25000.0],
+        }
+    )
+    assert bool(next30_lags_ok(board).iloc[0]) is False
+
+
+def test_prune_invalid_next30_drops_board_rows(tmp_path, monkeypatch):
+    from energy_forecast.live import load_board, prune_invalid_next30, save_board
+
+    monkeypatch.setattr("energy_forecast.paths.DATA_LIVE", tmp_path)
+    monkeypatch.setattr("energy_forecast.live.DATA_LIVE", tmp_path)
+    (tmp_path / "frozen").mkdir(parents=True, exist_ok=True)
+    board = pd.DataFrame(
+        {
+            "preset": ["next30", "next30", "day"],
+            "timestamp": pd.to_datetime(
+                ["2026-09-28T08:30:00Z", "2026-10-08T10:30:00Z", "2026-10-08T10:00:00Z"]
+            ),
+            "p50": [20000.0, 25000.0, 21000.0],
+            "actual_mw": [28000.0, 25100.0, 21100.0],
+            "demand_lag_1": [None, 25000.0, None],
+            "demand_lag_2": [None, 24800.0, None],
+        }
+    )
+    save_board(board)
+    out = prune_invalid_next30()
+    kept = load_board()
+    assert out["dropped"] == 1
+    assert out["kept"] == 1
+    assert list(kept.loc[kept["preset"] == "next30", "p50"]) == [25000.0]
+    assert (kept["preset"] == "day").any()
+
+
+def test_require_live_indo_lags_needs_two_recent_prints(monkeypatch):
+    from energy_forecast.forecast import require_live_indo_lags
+
+    monkeypatch.setattr(
+        pd.Timestamp,
+        "now",
+        lambda tz=None: pd.Timestamp("2026-10-09T10:20:00", tz="UTC"),
+        raising=False,
+    )
+    one = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-10-09T10:00:00Z"]),
+            "demand_mw": [20000.0],
+        }
+    )
+    monkeypatch.setattr("energy_forecast.forecast.fetch_indo", lambda *a, **k: one)
+    with pytest.raises(RuntimeError, match="fewer than two"):
+        require_live_indo_lags()
+
+    old = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-10-09T07:00:00Z", "2026-10-09T07:30:00Z"]),
+            "demand_mw": [19000.0, 19500.0],
+        }
+    )
+    monkeypatch.setattr("energy_forecast.forecast.fetch_indo", lambda *a, **k: old)
+    with pytest.raises(RuntimeError, match="min old"):
+        require_live_indo_lags()
+
+    ok = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-10-09T09:30:00Z", "2026-10-09T10:00:00Z"]),
+            "demand_mw": [19100.0, 19200.0],
+        }
+    )
+    monkeypatch.setattr("energy_forecast.forecast.fetch_indo", lambda *a, **k: ok)
+    last_ts, lag1, lag2 = require_live_indo_lags()
+    assert lag1 == 19200.0
+    assert lag2 == 19100.0
+    assert last_ts == pd.Timestamp("2026-10-09T10:00:00Z")

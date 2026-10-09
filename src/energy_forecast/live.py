@@ -578,6 +578,11 @@ def import_legacy_next30() -> int:
     add = shorts.loc[~shorts["timestamp"].isin(have)].copy()
     if add.empty:
         return 0
+    if "demand_lag_1" not in add.columns or "demand_lag_2" not in add.columns:
+        return 0
+    add = add.loc[add["demand_lag_1"].notna() & add["demand_lag_2"].notna()].copy()
+    if add.empty:
+        return 0
     add["preset"] = NEXT30
     add["issued_at"] = pd.to_datetime(add["issued_at"], utc=True)
     add["window_start"] = add["issued_at"]
@@ -592,12 +597,23 @@ def tick_presets(*, force: bool = False, week_password: str | None = None) -> di
     """Issue the 30-minute call, and the day/week freeze if that window is empty."""
     with _TICK_LOCK:
         imported = import_legacy_next30()
-        results = {"imported_next30": imported, "next30": _capture_preset(NEXT30, force=True)}
+        pruned = prune_invalid_next30()
+        results = {
+            "imported_next30": imported,
+            "pruned_next30": pruned,
+            "next30": _capture_preset(NEXT30, force=True),
+        }
         results["day"] = _capture_preset(DAY, force=force)
         results["week"] = _capture_preset(WEEK, force=force, week_password=week_password)
         results["context"] = refresh_context_actuals()
         results["actuals"] = refresh_actuals()
         results["wrmsse"] = refresh_wrmsse_cache()
+        try:
+            from energy_forecast.drift import check_and_alert
+
+            results["drift"] = check_and_alert()
+        except Exception as exc:  # noqa: BLE001 — capture must still finish
+            results["drift"] = {"ok": False, "error": str(exc)}
         return results
 
 
@@ -678,7 +694,10 @@ def _preset_frame(preset: str, board: pd.DataFrame | None = None) -> pd.DataFram
     frame = board if board is not None else load_board()
     if frame.empty or "preset" not in frame.columns:
         return frame
-    return frame.loc[frame["preset"] == preset].copy()
+    out = frame.loc[frame["preset"] == preset].copy()
+    if preset == NEXT30 and not out.empty:
+        out = out.loc[next30_lags_ok(out)].copy()
+    return out
 
 
 def _windows(preset: str, board: pd.DataFrame | None = None) -> list[pd.Timestamp]:
@@ -829,6 +848,55 @@ def _indo_records(start: pd.Timestamp, end: pd.Timestamp) -> list[dict]:
 
 MAX_INDO_AGE_MINUTES = LIVE_INDO_MAX_AGE_MINUTES
 LAG_MATCH_MW = 25.0
+# Wider than the input-health warning: this issue did not see the latest INDO.
+STALE_LAG_MW = 400.0
+
+
+def next30_lags_ok(frame: pd.DataFrame) -> pd.Series:
+    """True where the hour pack had both short lags, matching a recent INDO print."""
+    if frame is None or frame.empty:
+        return pd.Series(dtype=bool)
+    if "demand_lag_1" not in frame.columns or "demand_lag_2" not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    lag1 = pd.to_numeric(frame["demand_lag_1"], errors="coerce")
+    lag2 = pd.to_numeric(frame["demand_lag_2"], errors="coerce")
+    ok = pd.Series(np.isfinite(lag1.to_numpy()) & np.isfinite(lag2.to_numpy()), index=frame.index)
+    if "last_indo_mw" in frame.columns:
+        last = pd.to_numeric(frame["last_indo_mw"], errors="coerce")
+        mismatch = last.notna() & ((lag1 - last).abs() > STALE_LAG_MW)
+        ok &= ~mismatch
+    if {"issued_at", "last_indo_timestamp"}.issubset(frame.columns):
+        issued = pd.to_datetime(frame["issued_at"], utc=True, errors="coerce")
+        last_ts = pd.to_datetime(frame["last_indo_timestamp"], utc=True, errors="coerce")
+        age = (issued - last_ts).dt.total_seconds() / 60.0
+        ok &= ~(last_ts.notna() & issued.notna() & (age > MAX_INDO_AGE_MINUTES))
+    return ok
+
+
+def drop_invalid_next30_lags(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop next-30 rows that were issued without usable lag_1 / lag_2."""
+    if frame is None or frame.empty or "preset" not in frame.columns:
+        return frame
+    n30 = frame["preset"].astype(str) == NEXT30
+    if not n30.any():
+        return frame
+    keep = ~n30 | next30_lags_ok(frame)
+    return frame.loc[keep].copy()
+
+
+def prune_invalid_next30() -> dict:
+    """Persistently remove next-30 issues that lacked proper lags."""
+    board = load_board()
+    if board.empty or "preset" not in board.columns:
+        return {"dropped": 0, "kept": 0}
+    before = int((board["preset"] == NEXT30).sum())
+    cleaned = drop_invalid_next30_lags(board)
+    kept = int((cleaned["preset"] == NEXT30).sum()) if not cleaned.empty and "preset" in cleaned.columns else 0
+    dropped = before - kept
+    if dropped:
+        save_board(cleaned)
+        _BOARD_CACHE["payload"] = None
+    return {"dropped": int(dropped), "kept": kept}
 
 
 def _iso_stamp(value) -> str | None:
@@ -1070,15 +1138,49 @@ def _next30_live_row(scored: pd.DataFrame, now_utc: pd.Timestamp) -> pd.DataFram
     return pool.sort_values("timestamp").iloc[-1:]
 
 
+def _day_archive_payload(
+    window_start: pd.Timestamp,
+    board: pd.DataFrame,
+    context: pd.DataFrame,
+    wrmsse: float | None = None,
+) -> dict:
+    start, end, expected = london_day_range(window_start)
+    if expected <= 0:
+        start = _as_utc(window_start)
+        end = start + pd.Timedelta(days=1)
+    rows = _pad_actual_slots(_span_rows(DAY, start, end, board), context, start, end)
+    return _window_payload(DAY, window_start, board, wrmsse=wrmsse, context=context, rows=rows)
+
+
+def _week_archive_payload(
+    window_start: pd.Timestamp,
+    board: pd.DataFrame,
+    context: pd.DataFrame,
+    wrmsse: float | None = None,
+) -> dict:
+    start = _as_utc(window_start)
+    end = start + pd.Timedelta(days=7)
+    rows = _pad_actual_slots(_span_rows(WEEK, start, end, board), context, start, end)
+    return _window_payload(WEEK, window_start, board, wrmsse=wrmsse, context=context, rows=rows)
+
+
 def _next30_history(
     next30: pd.DataFrame,
     live30: pd.DataFrame,
     now_utc: pd.Timestamp,
     context: pd.DataFrame,
+    *,
+    hours: float | None = NEXT30_CHART_HOURS,
 ) -> pd.DataFrame:
-    """Issued guesses and INDO for the last six hours, up to the live target."""
+    """Issued guesses and INDO up to the live target. Default window is six hours."""
     now_utc = _as_utc(now_utc)
-    cutoff = now_utc - pd.Timedelta(hours=NEXT30_CHART_HOURS)
+    if hours is None:
+        if next30 is None or next30.empty or "timestamp" not in next30.columns:
+            cutoff = now_utc - pd.Timedelta(hours=NEXT30_CHART_HOURS)
+        else:
+            cutoff = pd.to_datetime(next30["timestamp"], utc=True).min()
+    else:
+        cutoff = now_utc - pd.Timedelta(hours=hours)
     history = next30.copy()
     if not history.empty:
         if "issued_at" in history.columns:
@@ -1224,7 +1326,7 @@ def board_payload(*, refresh: bool = False) -> dict:
     live30 = _next30_live_row(scored30, now_utc)
     day_windows = _windows(DAY, board)
     week_windows = _windows(WEEK, board)
-    history30 = _next30_history(next30, live30, now_utc, context)
+    history30 = _next30_history(next30, live30, now_utc, context, hours=None)
     live_window = live30["window_start"].iloc[0] if not live30.empty else None
     n30_metrics = preset_metrics(_overlay_next30_actuals(next30, context), compute_wrmsse=False)
     n30_metrics["wrmsse"] = wrmsse.get(NEXT30)
@@ -1237,6 +1339,18 @@ def board_payload(*, refresh: bool = False) -> dict:
     last_monday = previous_week_window(now)
     week_left = week_previous_chart_start(now)
     next_monday = this_monday + pd.Timedelta(days=7)
+    day_archives = [
+        _day_archive_payload(
+            window, board, context, wrmsse.get(DAY) if _as_utc(window) == _as_utc(today) else None
+        )
+        for window in day_windows
+    ]
+    week_archives = [
+        _week_archive_payload(
+            window, board, context, wrmsse.get(WEEK) if _as_utc(window) == _as_utc(this_monday) else None
+        )
+        for window in week_windows
+    ]
     payload = {
         "as_of": now.isoformat(),
         "next30": {
@@ -1264,6 +1378,7 @@ def board_payload(*, refresh: bool = False) -> dict:
                 rows=_pad_actual_slots(_span_rows(DAY, y_start, y_end, board), context, y_start, y_end),
             ),
             "previous_actuals": _previous_actuals(DAY, day_windows, board, context),
+            "archives": day_archives,
         },
         "week": {
             "current": _window_payload(
@@ -1286,6 +1401,7 @@ def board_payload(*, refresh: bool = False) -> dict:
                 ),
             ),
             "previous_actuals": _previous_actuals(WEEK, week_windows, board, context),
+            "archives": week_archives,
         },
         "eval": evaluation_payload(board, context, audit),
         "lab": model_lab_payload(),

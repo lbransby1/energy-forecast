@@ -76,6 +76,16 @@ LGB_WEEK = {
     "feature_fraction": 0.65,
 }
 WEEK_N_ESTIMATORS = 450
+# Optuna next_hour winner (holdout MAE ~262 vs stock 285).
+LGB_HOUR = {
+    "learning_rate": 0.06572809310323258,
+    "num_leaves": 92,
+    "min_child_samples": 67,
+    "subsample": 0.8802539290826998,
+    "colsample_bytree": 0.9977886492180295,
+    "feature_fraction": 0.9977886492180295,
+}
+HOUR_N_ESTIMATORS = 500
 
 
 @dataclass
@@ -322,6 +332,30 @@ def train_models(
                 "value": float(next(iter(models.interval_scale.values()), 1.0)),
             }
         )
+        error = scored["demand_mw"].to_numpy() - scored["p50"].to_numpy()
+        metric_rows.append({"metric": "rmse", "quantile": 0.5, "value": float(np.sqrt(np.mean(error**2)))})
+        metric_rows.append({"metric": "bias", "quantile": 0.5, "value": float(np.mean(error))})
+        if {"p10", "p90"}.issubset(scored.columns):
+            metric_rows.append(
+                {
+                    "metric": "interval_width",
+                    "quantile": 0.8,
+                    "value": float((scored["p90"] - scored["p10"]).mean()),
+                }
+            )
+        try:
+            from energy_forecast.evaluate import _naive_scale_mse, _period_band, _wrmsse
+
+            work = scored.copy()
+            if "period_band" not in work.columns and "settlement_period" in work.columns:
+                work["period_band"] = work["settlement_period"].map(_period_band)
+            scale = _naive_scale_mse(train, "30min", 48 * 7)
+            if np.isfinite(scale) and scale > 0:
+                metric_rows.append(
+                    {"metric": "wrmsse", "quantile": 0.5, "value": float(_wrmsse(work, scale))}
+                )
+        except Exception:  # noqa: BLE001 — pinball/MAE still land if WRMSSE cannot
+            pass
 
     metrics = pd.DataFrame(metric_rows)
     save_models(models, model_dir)
@@ -338,6 +372,7 @@ def train_hour_models(
     model_dir: Path | None = None,
     n_estimators: int = 400,
     exclude_years: tuple[int, ...] = HOUR_EXCLUDE_TRAIN_YEARS,
+    lgb_params: dict | None = None,
 ) -> tuple[QuantileModels, pd.DataFrame]:
     """Fit the next-hour model on ERA5 weather and recent demand lags."""
     return train_models(
@@ -350,6 +385,7 @@ def train_hour_models(
         features=HOUR_FEATURE_COLUMNS,
         max_lead_hours=HOUR_MAX_LEAD_HOURS,
         role="next_hour",
+        lgb_params=lgb_params,
     )
 
 
@@ -476,6 +512,8 @@ def _lead_width_factor(lead_hours: np.ndarray) -> np.ndarray:
 def _role_tree_settings(role: str, n_estimators: int) -> tuple[dict, int]:
     if role == "week":
         return dict(LGB_WEEK), WEEK_N_ESTIMATORS
+    if role in {"next_hour", "hour"}:
+        return dict(LGB_HOUR), HOUR_N_ESTIMATORS
     return {}, n_estimators
 
 

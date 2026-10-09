@@ -32,7 +32,7 @@ def test_dashboard_has_models_tab_not_review():
     response = client.get("/")
     assert response.status_code == 200
     html = response.text
-    assert "How the models work" in html
+    assert "Model Architecture" in html
     assert "What the scores mean" in html
     assert 'class="shap-row"' in html
     assert "How the models were trained" in html
@@ -42,12 +42,28 @@ def test_dashboard_has_models_tab_not_review():
     assert ">Scores</summary>" in html
     assert "Holdout (last train)" in html
     assert 'id="models-view"' in html
+    assert 'id="pipeline-view"' in html
     assert 'id="live-view"' in html
+    assert 'id="reload"' not in html
     assert "After the fact" not in html
     assert "Rebuild review" not in html
     assert 'id="review-view"' not in html
     assert "/shap" in html
+    assert "/drift" in html
     assert "the project is complete" in html.lower() or "This site is <b>finished</b>" in html
+
+
+def test_drift_get_is_local_only(monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("drift must not fetch weather")
+
+    monkeypatch.setattr("energy_forecast.data.weather.fetch_forecast_weather", boom)
+    monkeypatch.setattr("energy_forecast.data.weather.fetch_historical_weather", boom)
+    monkeypatch.setattr("energy_forecast.data.elexon.fetch_indo", boom)
+    response = client.get("/drift")
+    assert response.status_code == 200
+    body = response.json()
+    assert "note" in body or "packs" in body
 
 
 def test_shap_get_is_local_only(monkeypatch):

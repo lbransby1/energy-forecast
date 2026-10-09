@@ -12,7 +12,7 @@ National Demand is a half-hourly GB series (NESO `ND` historically, INDO live). 
 
 | Product | Horizon | Model | What “good” looks like on holdout |
 |---|---|---|---|
-| Next 30 minutes | one settlement period | Hour pack (ERA5 + last 30/60 min INDO) | tight band; lags must be the latest published outturn |
+| Next 30 minutes | one settlement period | Hour pack (ERA5 + last 30/60 min INDO, Optuna) | ~264 MW MAE; skipped unless lag_1/lag_2 are the latest INDO prints |
 | Next 24 hours | midnight freeze | Day pack (Previous Runs weather) | ~830 MW MAE, ~82% in the 80% interval |
 | Next 7 days | Monday 00:00 freeze | Week pack (Previous Runs, Optuna) | ~870 MW MAE, fan widens with lead |
 
@@ -27,7 +27,7 @@ Domain constraint that shaped the engineering: **no GSP / regional models**. The
 ### Package and API design
 
 - Installable library (`src/` layout, `pyproject.toml`, `pip install -e .`) with a public forecast API (`run_forecast`, `run_pack`) and a live ops module (`energy_forecast.live`).
-- Clear module boundaries: `data/` (NESO, Elexon, Open-Meteo), `features`, `model`, `evaluate`, `forecast`, `live`, `app`, `explain`, `cases`, `tune`.
+- Clear module boundaries: `data/` (NESO, Elexon, Open-Meteo), `features`, `model`, `evaluate`, `forecast`, `live`, `app`, `explain`, `lab`, `drift`, `cases`, `tune`.
 - Typed-ish Python 3.11 (`from __future__ import annotations`, dataclasses for model bundles and case studies).
 - CLI for capture / score / board without the HTTP server (`python -m energy_forecast.live`).
 
@@ -43,6 +43,7 @@ Domain constraint that shaped the engineering: **no GSP / regional models**. The
 - Weather from three Open-Meteo surfaces (ERA5 archive, operational forecast, Previous Runs) with **retries on 429/502/503/504**, backoff, and forecast-cache fallback when the API is down.
 - Parquet caches; **atomic write** (temp file + `os.replace`) and an in-process lock so concurrent dashboard refreshes and the capture loop cannot tear `indo.parquet`.
 - Frozen **feature snapshots** per day/week (and next-30) freeze so a live miss can be audited: lags, weather, last INDO timestamp, missing columns.
+- **Drift check** on the capture loop (`energy_forecast.drift`): live MAE vs last-train holdout (≥1.5×) and coverage floor (55%), 12-hour cooldown, optional SMTP. `GET /drift` reads `data/live/drift.json` only.
 
 ### Backend and product surface
 
@@ -53,7 +54,7 @@ Domain constraint that shaped the engineering: **no GSP / regional models**. The
 
 ### Frontend / UX engineering
 
-- Single-page dashboard: live board plus a **How the models work** tab. Three presets, London-time axis ticks, previous-window INDO in grey then the live fan, next-30 **issued history vs live dots**. Scores, freeze diagnostics, the INDO lag check, and the metric glossary are **dropdowns**. Training holdout vs this-freeze MAE and three SHAP columns sit on the models tab.
+- Single-page dashboard: **Live board**, **Model Architecture**, and **Data Pipeline and Maintenance**. Three presets, London-time axis ticks, previous-window INDO in grey then the live fan, next-30 **issued history vs live dots**. Scores, freeze diagnostics, the INDO lag check, and the metric glossary are **dropdowns**. Training holdout vs this-freeze MAE and three SHAP columns sit on the models tab. The pipeline tab is ingestion → processing → issue/freeze/score → API, plus drift-mail status. Capture is automatic; there is no reload or “issue due” button.
 - ISO-8601 `Z` timestamps so the browser does not parse `+0000` as local and shift the live point by an hour.
 
 ### Production debugging
@@ -121,7 +122,7 @@ Case-study notebook: holiday, **working Tuesday after a holiday** (the real miss
 
 ### Explainability
 
-- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails. The live **How the models work** tab shows mean-tree SHAP from frozen parquet (`GET /shap`, no weather API).
+- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails. The live **Model Architecture** tab shows mean-tree SHAP from frozen parquet (`GET /shap`, no weather API).
 - Explanations routed by which pack scored that row (hour vs day vs week).
 
 ### Evaluation culture
