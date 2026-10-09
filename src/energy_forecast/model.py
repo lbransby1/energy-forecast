@@ -22,6 +22,7 @@ from energy_forecast.features import (
 from energy_forecast.paths import DATA_MODELS, DATA_MODELS_DAY, DATA_MODELS_HOUR, ensure_data_dirs
 
 DEFAULT_QUANTILES = (0.1, 0.5, 0.9)
+TAIL_QUANTILES = (0.1, 0.9)
 HOLDOUT_DAYS = 56
 TARGET_COVERAGE = 0.80
 CALIB_DAYS = 21
@@ -54,13 +55,25 @@ LGB_RESIDUAL = {
     "colsample_bytree": 0.8,
     "verbosity": -1,
 }
+# Unused Optuna `short` winner (holdout MAE 841). Production day still uses stock LGB.
+LGB_DAY = {
+    "learning_rate": 0.05154938259471686,
+    "num_leaves": 45,
+    "min_child_samples": 62,
+    "subsample": 0.8084151420110467,
+    "colsample_bytree": 0.6235476485104684,
+    "feature_fraction": 0.6235476485104684,
+}
+DAY_N_ESTIMATORS = 450
 # Optuna winner for medium (6-hourly, 7d) holdout MAE 862 vs 928.
+# feature_fraction is the native LightGBM name; colsample_bytree is the sklearn alias.
 LGB_WEEK = {
     "learning_rate": 0.022965408930055223,
     "num_leaves": 19,
     "min_child_samples": 61,
     "subsample": 0.781673112232677,
-    "colsample_bytree": 0.6385450911486689,
+    "colsample_bytree": 0.65,
+    "feature_fraction": 0.65,
 }
 WEEK_N_ESTIMATORS = 450
 
@@ -155,6 +168,8 @@ def fit_models(
 
         series_calib = calib[calib["region_id"] == series_id] if not calib.empty else series_fit.iloc[0:0]
         scale_frame = series_calib if not series_calib.empty else series_fit
+        # Scale on trees that have not seen calib. After refit those days are in-sample
+        # and the raw P10/P90 already look like 80%, so the stretch collapses to 1.
         interval_scale[str(series_id)] = _coverage_scale(
             scale_frame,
             mean_booster,
@@ -164,18 +179,17 @@ def fit_models(
             target_coverage,
         )
 
-        if not refit_full:
-            continue
-        series_all = work[work["region_id"] == series_id]
-        mean_booster = _fit_mean(series_all, feature_cols, mean_params, n_estimators)
-        mean_hat = np.asarray(mean_booster.predict(series_all[feature_cols]))
-        x_phase2 = series_all[feature_cols].copy()
-        x_phase2[MEAN_FEATURE] = mean_hat
-        mean_boosters[str(series_id)] = mean_booster
-        for quantile in quantiles:
-            residual_boosters[(str(series_id), float(quantile))] = _fit_phase2_quantile(
-                x_phase2, series_all["demand_mw"].to_numpy(), quantile, n_estimators, residual_params
-            )
+        if refit_full:
+            series_all = work[work["region_id"] == series_id]
+            mean_booster = _fit_mean(series_all, feature_cols, mean_params, n_estimators)
+            mean_hat = np.asarray(mean_booster.predict(series_all[feature_cols]))
+            x_phase2 = series_all[feature_cols].copy()
+            x_phase2[MEAN_FEATURE] = mean_hat
+            mean_boosters[str(series_id)] = mean_booster
+            for quantile in quantiles:
+                residual_boosters[(str(series_id), float(quantile))] = _fit_phase2_quantile(
+                    x_phase2, series_all["demand_mw"].to_numpy(), quantile, n_estimators, residual_params
+                )
 
     extra = metadata or {}
     return QuantileModels(
@@ -202,6 +216,19 @@ def fit_models(
     )
 
 
+def day_quantile_params(mean_params: dict | None = None) -> dict:
+    """Fewer, fatter leaves on P10/P90 so the raw band is not a hairline around P50."""
+    base = {**LGB_RESIDUAL, **(mean_params or {})}
+    leaves = int(base.get("num_leaves", 47))
+    child = int(base.get("min_child_samples", 20))
+    out = dict(base)
+    out["num_leaves"] = max(15, min(31, leaves // 2))
+    out["min_child_samples"] = max(80, child)
+    if "colsample_bytree" in out and "feature_fraction" not in out:
+        out["feature_fraction"] = float(out["colsample_bytree"])
+    return out
+
+
 def train_models(
     frame: pd.DataFrame,
     *,
@@ -213,6 +240,8 @@ def train_models(
     features: list[str] | None = None,
     max_lead_hours: float | None = None,
     role: str = "week",
+    lgb_params: dict | None = None,
+    residual_params: dict | None = None,
 ) -> tuple[QuantileModels, pd.DataFrame]:
     """Fit the two-phase model. Last ``holdout_days`` are held out for metrics."""
     model_dir = model_dir or DATA_MODELS
@@ -227,14 +256,29 @@ def train_models(
     )
     cutoff = train["timestamp"].max() if holdout.empty else holdout["timestamp"].min()
     tree_params, trees = _role_tree_settings(role, n_estimators)
+    if lgb_params:
+        extra = {key: value for key, value in lgb_params.items() if key != "n_estimators"}
+        tree_params = {**tree_params, **extra}
+        if "n_estimators" in lgb_params:
+            trees = int(lgb_params["n_estimators"])
+        if "feature_fraction" not in tree_params and "colsample_bytree" in tree_params:
+            tree_params["feature_fraction"] = float(tree_params["colsample_bytree"])
 
+    resid_params = dict(tree_params)
+    if residual_params:
+        extra_resid = {key: value for key, value in residual_params.items() if key != "n_estimators"}
+        resid_params = {**resid_params, **extra_resid}
+        if "feature_fraction" not in resid_params and "colsample_bytree" in resid_params:
+            resid_params["feature_fraction"] = float(resid_params["colsample_bytree"])
+    resid_params.pop("objective", None)
+    resid_params.pop("metric", None)
     models = fit_models(
         train,
         quantiles=quantiles,
         n_estimators=trees,
         features=feature_cols,
         mean_params=tree_params,
-        residual_params=tree_params,
+        residual_params=resid_params,
         metadata={
             "role": role,
             "holdout_start": str(cutoff),
@@ -242,14 +286,20 @@ def train_models(
             "exclude_years": list(exclude_years),
             "max_lead_hours": max_lead_hours,
             "lgb_params": tree_params,
+            "residual_params": resid_params,
         },
     )
 
     metric_rows: list[dict] = []
     if not holdout.empty:
         scored = predict_quantiles(holdout, models)
-        for quantile in models.quantiles:
+        scored_quantiles = list(models.quantiles)
+        if 0.5 not in scored_quantiles and "p50" in scored.columns:
+            scored_quantiles = [*scored_quantiles, 0.5]
+        for quantile in scored_quantiles:
             column = _quantile_column(quantile)
+            if column not in scored.columns:
+                continue
             metric_rows.extend(
                 _quantile_metrics(
                     quantile=float(quantile),
@@ -384,6 +434,7 @@ def predict_quantiles(frame: pd.DataFrame, models: QuantileModels) -> pd.DataFra
     for quantile in models.quantiles:
         out[_quantile_column(quantile)] = np.nan
     out["mean_pred"] = np.nan
+    out["p50"] = np.nan
 
     for series_id, group in out.groupby("region_id"):
         mean_booster = models.mean_boosters.get(str(series_id))
@@ -404,15 +455,16 @@ def predict_quantiles(frame: pd.DataFrame, models: QuantileModels) -> pd.DataFra
         if role == "week" and "lead_hours" in group.columns:
             scale = scale * _lead_width_factor(group["lead_hours"].to_numpy())
         center = levels.get(0.5, mean_hat)
+        out.loc[group.index, "p50"] = center
         for quantile in models.quantiles:
+            if float(quantile) == 0.5:
+                continue
             level = levels.get(quantile)
             if level is None:
                 continue
-            if quantile == 0.5:
-                out.loc[group.index, _quantile_column(quantile)] = center
-            else:
-                out.loc[group.index, _quantile_column(quantile)] = center + scale * (level - center)
-    return _enforce_quantile_order(out, models.quantiles)
+            out.loc[group.index, _quantile_column(quantile)] = center + scale * (level - center)
+    order = tuple(sorted({*models.quantiles, 0.5}))
+    return _enforce_quantile_order(out, order)
 
 
 def _lead_width_factor(lead_hours: np.ndarray) -> np.ndarray:
@@ -427,6 +479,14 @@ def _role_tree_settings(role: str, n_estimators: int) -> tuple[dict, int]:
     return {}, n_estimators
 
 
+def _native_lgb_params(params: dict) -> dict:
+    """LightGBM ``train()`` uses feature_fraction, not the sklearn alias."""
+    out = dict(params)
+    if "feature_fraction" not in out and "colsample_bytree" in out:
+        out["feature_fraction"] = float(out["colsample_bytree"])
+    return out
+
+
 def _fit_mean(
     frame: pd.DataFrame,
     features: list[str],
@@ -434,7 +494,7 @@ def _fit_mean(
     n_estimators: int = 400,
 ) -> lgb.Booster:
     dataset = lgb.Dataset(frame[features], label=frame["demand_mw"], free_raw_data=False)
-    return lgb.train({**LGB_MEAN, **(params or {})}, dataset, num_boost_round=n_estimators)
+    return lgb.train(_native_lgb_params({**LGB_MEAN, **(params or {})}), dataset, num_boost_round=n_estimators)
 
 
 def _fit_phase2_quantile(
@@ -446,7 +506,7 @@ def _fit_phase2_quantile(
 ) -> lgb.Booster:
     dataset = lgb.Dataset(features, label=demand_mw, free_raw_data=False)
     return lgb.train(
-        {**LGB_RESIDUAL, **(params or {}), "objective": "quantile", "alpha": quantile},
+        _native_lgb_params({**LGB_RESIDUAL, **(params or {}), "objective": "quantile", "alpha": quantile}),
         dataset,
         num_boost_round=n_estimators,
     )
@@ -466,8 +526,11 @@ def _coverage_scale(
     x_phase2 = frame[features].copy()
     x_phase2[MEAN_FEATURE] = mean_hat
     q10 = np.asarray(residual_boosters[0.1].predict(x_phase2[residual_features]))
-    q50 = np.asarray(residual_boosters[0.5].predict(x_phase2[residual_features]))
     q90 = np.asarray(residual_boosters[0.9].predict(x_phase2[residual_features]))
+    if 0.5 in residual_boosters:
+        q50 = np.asarray(residual_boosters[0.5].predict(x_phase2[residual_features]))
+    else:
+        q50 = mean_hat
     actual = frame["demand_mw"].to_numpy()
     if float(np.mean((actual >= q10) & (actual <= q90))) >= target_coverage:
         return 1.0

@@ -34,8 +34,10 @@ def test_reissue_week_without_password_raises(monkeypatch):
     )
     monkeypatch.setattr("energy_forecast.live.load_board", lambda: board)
     monkeypatch.setattr("energy_forecast.live.week_window", lambda when=None: pd.Timestamp("2026-09-27T23:00:00Z"))
-    with pytest.raises(WeekReissueLocked):
+    with pytest.raises(WeekReissueLocked, match="does not match"):
         capture_preset("week", force=True, week_password="wrong")
+    with pytest.raises(WeekReissueLocked, match="password required"):
+        capture_preset("week", force=True, week_password="")
 
 
 def test_board_payload_does_not_call_insights(monkeypatch):
@@ -197,6 +199,56 @@ def test_week_actuals_cover_hours_before_a_late_freeze(monkeypatch):
     assert 20000.0 in [row["p50"] for row in cur if row.get("p50") is not None]
 
 
+def test_next30_overlay_keeps_board_actual_outside_context():
+    from energy_forecast.live import _overlay_next30_actuals
+
+    guess = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-09-26T14:00:00Z", "2026-09-29T12:30:00Z"]),
+            "actual_mw": [15952.0, 99999.0],
+        }
+    )
+    context = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-09-29T12:00:00Z"]),
+            "actual_mw": [25000.0],
+        }
+    )
+    out = _overlay_next30_actuals(guess, context)
+    assert float(out["actual_mw"].iloc[0]) == 15952.0
+    assert float(out["actual_mw"].iloc[1]) == 25000.0
+
+
+def test_next30_live_row_skips_ancient_holes(monkeypatch):
+    from energy_forecast.live import _BOARD_CACHE, board_payload
+
+    board = pd.DataFrame(
+        {
+            "preset": ["next30", "next30"],
+            "window_start": pd.to_datetime(["2026-09-26T13:00:00Z", "2026-10-08T21:30:00Z"]),
+            "timestamp": pd.to_datetime(["2026-09-26T14:00:00Z", "2026-10-08T22:00:00Z"]),
+            "issued_at": pd.to_datetime(["2026-09-26T13:00:00Z", "2026-10-08T21:30:00Z"]),
+            "p10": [15000.0, 23000.0],
+            "p50": [15952.0, 24226.0],
+            "p90": [17000.0, 25000.0],
+            "actual_mw": [None, None],
+            "demand_lag_1": [None, 25790.0],
+            "last_indo_mw": [None, 25790.0],
+        }
+    )
+    monkeypatch.setattr("energy_forecast.live.load_board", lambda: board)
+    monkeypatch.setattr("energy_forecast.live.load_context_actuals", lambda: pd.DataFrame())
+    monkeypatch.setattr(
+        "energy_forecast.live.london_now",
+        lambda: pd.Timestamp("2026-10-08T22:48:00", tz="Europe/London"),
+    )
+    _BOARD_CACHE["payload"] = None
+    payload = board_payload(refresh=False)
+    live = payload["next30"]["current"][0]
+    assert live["timestamp"].startswith("2026-10-08T22:00:00")
+    assert live["p50"] == 24226.0
+
+
 def test_next30_actuals_sit_at_period_end(monkeypatch):
     from energy_forecast.live import _overlay_next30_actuals, _window_payload
 
@@ -318,6 +370,9 @@ def test_evaluation_tags_outside_band_and_lags():
     assert out["scored"] == 2
     assert out["outside_band"] == 1
     assert out["lags"] == 1
+    assert out["by_preset"]["day"]["outside_band"] == 1
+    assert out["by_preset"]["next30"]["lags"] == 0
+    assert out["by_preset"]["week"]["scored"] == 0
 
 
 def test_width_averages_the_full_issued_fan():

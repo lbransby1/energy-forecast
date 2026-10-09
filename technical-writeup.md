@@ -1,6 +1,6 @@
 # Technical abilities — GB National Demand quantile forecast
 
-The product is a **P10 / P50 / P90** forecast of Great Britain National Demand, scored against **Elexon Insights INDO** after each half-hour settlement period.
+**Complete.** The product is a **P10 / P50 / P90** forecast of Great Britain National Demand, scored against **Elexon Insights INDO** after each half-hour settlement period.
 
 Stack in one line: **Python 3.11, pandas, LightGBM, Optuna, SHAP, FastAPI, Parquet, Docker**, plus public energy and weather APIs.
 
@@ -53,7 +53,7 @@ Domain constraint that shaped the engineering: **no GSP / regional models**. The
 
 ### Frontend / UX engineering
 
-- Single-page dashboard: three presets, London-time axis ticks, previous-window INDO in grey then the live fan, next-30 **issued history vs live dots**, input-health line, stale-lag audit table.
+- Single-page dashboard: live board plus a **How the models work** tab. Three presets, London-time axis ticks, previous-window INDO in grey then the live fan, next-30 **issued history vs live dots**. Scores, freeze diagnostics, the INDO lag check, and the metric glossary are **dropdowns**. Training holdout vs this-freeze MAE and three SHAP columns sit on the models tab.
 - ISO-8601 `Z` timestamps so the browser does not parse `+0000` as local and shift the live point by an hour.
 
 ### Production debugging
@@ -121,7 +121,7 @@ Case-study notebook: holiday, **working Tuesday after a holiday** (the real miss
 
 ### Explainability
 
-- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails. (not available on online demo as of 28/9/26, is in notebook)
+- **SHAP** (`pred_contrib`) on the **mean, P10, and P90** boosters for the live path. P50 is not explained as if it were the mean. `mean_pred` is not treated as a SHAP feature for the tails. The live **How the models work** tab shows mean-tree SHAP from frozen parquet (`GET /shap`, no weather API).
 - Explanations routed by which pack scored that row (hour vs day vs week).
 
 ### Evaluation culture

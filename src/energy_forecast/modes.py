@@ -46,6 +46,18 @@ MODE_SPEC = {
 }
 _PERIODS_PER_BIN = {"30min": 1, "1h": 2, "6h": 12}
 
+
+def floor_london(stamp: pd.Series, freq: str) -> pd.Series:
+    """Floor to a London clock grid across many years.
+
+    ``ambiguous='infer'`` only works when the series contains a single DST
+    fold. K-fold windows span several Octobers, so pin the overlap hour to
+    standard time (GMT).
+    """
+    local = pd.to_datetime(stamp, utc=True).dt.tz_convert(LONDON_TZ)
+    return local.dt.floor(freq, ambiguous=False, nonexistent="shift_forward")
+
+
 _MEAN_COLS = (
     "p10",
     "p50",
@@ -74,8 +86,7 @@ def resample_to_mode(frame: pd.DataFrame, mode: str, freq: str | None = None) ->
     spec = MODE_SPEC[mode]
     use_freq = freq or spec["freq"]
     work = frame.copy()
-    stamp = pd.to_datetime(work["timestamp"], utc=True).dt.tz_convert(LONDON_TZ)
-    work["_bin"] = stamp.dt.floor(use_freq, ambiguous="infer", nonexistent="shift_forward")
+    work["_bin"] = floor_london(work["timestamp"], use_freq)
 
     group_cols = ["_bin"]
     if "region_id" in work.columns:

@@ -10,4 +10,5 @@ services:
     volumes:
       - ./data/live:/app/data/live
       - ./data/processed:/app/data/processed
+      - ./data/models:/app/data/models
     restart: unless-stopped

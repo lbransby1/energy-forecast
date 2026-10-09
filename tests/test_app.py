@@ -17,15 +17,36 @@ def test_dashboard_html():
     response = client.get("/")
     assert response.status_code == 200
     assert "Grid Demand UK" in response.text
-    assert "three&nbsp;views" in response.text
+    assert "Three&nbsp;views" in response.text
     assert "Typical size of the miss" in response.text
+    assert "What the scores mean" in response.text
+    assert 'class="shap-row"' in response.text
     assert "This chart is the last two days of last week" in response.text
     assert "Yesterday’s forecast vs actual" in response.text or "yesterday" in response.text.lower()
     assert "Yesterday forecast CSV" in response.text
-    assert "How the guesses did" in response.text
+    assert "How the guesses did" not in response.text
+    assert "How this freeze did" in response.text
     assert "How the models were trained" in response.text
+    assert "How the models work" in response.text
+    assert 'id="week-eval-cards"' in response.text
+    assert 'id="lab"' in response.text
+    assert response.text.index('id="models-view"') < response.text.index('id="lab-packs"')
+    assert "This freeze" in response.text
+    assert "Holdout (last train)" in response.text
+    assert 'id="week-holdout"' in response.text
+    assert 'id="day-holdout"' in response.text
+    assert 'id="n30-holdout"' in response.text
+    assert "After the fact" not in response.text
+    assert "Rebuild review" not in response.text
+    assert "The project is complete" in response.text
+    assert "Freeze cov" not in response.text
+    assert "<th>Tuned</th>" not in response.text
     assert "WANDB_PROJECT_URL" in response.text
-    assert 'class="side"' in response.text
+    assert "MLflow" not in response.text
+    assert 'class="side"' not in response.text
+    assert "details.fold" in response.text
+    assert ">Scores</summary>" in response.text
+    assert "INDO lag check" in response.text
     assert response.text.index('id="next30"') < response.text.index('id="n30-audit"')
     assert "Segoe UI" in response.text
     assert "Georgia" not in response.text

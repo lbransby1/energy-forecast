@@ -1,6 +1,6 @@
 # GB National Demand forecast — systems architecture
 
-Live **P10 / P50 / P90** forecast of Great Britain National Demand. Weather in, quantiles out, scored against Elexon Insights **INDO** after each settlement period. Built as a production service, not a notebook dump.
+**Status: complete.** Live **P10 / P50 / P90** forecast of Great Britain National Demand. Weather in, quantiles out, scored against Elexon Insights **INDO** after each settlement period. Built as a production service, not a notebook dump.
 
 Source: [github.com/lbransby1/energy-forecast](https://github.com/lbransby1/energy-forecast). This document is the architecture view for software and ML engineering. Skills narrative: [`technical-writeup.md`](technical-writeup.md).
 
@@ -16,8 +16,9 @@ Open-Meteo (ERA5 / forecast / Previous Runs)     NESO ND (historic CSV)
                               |
                               v
                     FastAPI  :8000
-                    GET /           HTML dashboard (static)
+                    GET /           HTML dashboard (live board + models tab)
                     GET /board      local parquet JSON (fast path)
+                    GET /shap       mean-tree SHAP from frozen rows
                     POST /capture   issue forecasts (slow path)
                               |
                               v
@@ -32,9 +33,11 @@ Open-Meteo (ERA5 / forecast / Previous Runs)     NESO ND (historic CSV)
 |---|---|---|---|
 | **next30** | every half-hour (:10 / :40 London) | hour (ERA5 + `lag_1`/`lag_2`) | next settlement period |
 | **day** | midnight London, freeze | day (Previous Runs) | 24 h |
-| **week** | Monday 00:00 London, freeze | week (Previous Runs, Optuna) | 168 h |
+| **week** | Monday 00:00 London, freeze | week v3 (Previous Runs, Optuna, no `lag_48`) | 168 h |
 
 The live contract: **write the forecast first**, join INDO only after that period has ended. Holdout MAE is not the score that matters; the board is. Yesterday is **INDO only** (what happened). Today is the **issued fan** (P10 / P50 / P90). Elapsed hours of today get a black INDO overlay as Insights publishes. The day pack is not seeded with yesterday’s predictions; it runs forward from the midnight freeze.
+
+The dashboard has two tabs. **Live board** is the three charts. Scores, how this freeze did, the half-hour INDO lag check, and the metric glossary sit in dropdowns under the plots. **How the models work** is the wrap-up: how the packs were coded, the last-train table (holdout MAE vs this freeze MAE), and three SHAP columns on one row. There is no after-the-fact review tab. `GET /board` and `GET /shap` never call weather APIs.
 
 Live demo: [energy-forecast-production.up.railway.app](https://energy-forecast-production.up.railway.app)
 
@@ -56,6 +59,7 @@ One **uvicorn** worker (file-backed state is not safe across multiple writers). 
 |---|---|---|
 | `GET /` `GET /health` | milliseconds | HTML / `{ok: true}` |
 | `GET /board` | local parquet | charts + MAE/coverage; **no Insights/Open-Meteo** |
+| `GET /shap` | local parquet + trees | mean-tree SHAP for hour/day/week; **no weather APIs** |
 | `POST /capture` | seconds–tens of seconds, **background thread** | weather fetch, LightGBM, freeze, INDO join, WRMSSE cache |
 
 WRMSSE needs 56 days of INDO. It is computed on the **capture loop**, cached in `data/live/wrmsse_cache.json`, and only *read* on `/board`.
@@ -83,24 +87,26 @@ Two-phase LightGBM: **mean** booster, then **residual quantiles** P10/P50/P90. P
 
 | Pack | Weather in train | Short lags | Live route |
 |---|---|---|---|
-| Hour | ERA5 | last published INDO | `lead ≤ 1 h` |
-| Day | Previous Runs | no | `1 < lead ≤ 24 h` |
-| Week | Previous Runs | no | `lead > 24 h` |
+| Hour | ERA5 | last published INDO (`lag_1` / `lag_2`) | `lead ≤ 1 h` |
+| Day | Previous Runs | yesterday known (`lag_48`) | `1 < lead ≤ 24 h` |
+| Week v3 | Previous Runs | no `lag_48`; week-over-week weather + 14d / 3-week demand extras; **direct** predict | `lead > 24 h` |
 
 COVID years 2020–2023 are out of day/week training. Hour pack may use 2022–2023.
 
 **Leakage rule:** day/week holdout weather is Previous Runs (what would have been available at issue), not perfect ERA5.
 
-Features: calendar + UK holidays, HDD/CDD (15.5 °C), weather trajectory (past rolls + **forward** 12h/24h on the forecast path), lags 1/2/48/336. Climatology fills only 48/336. Holiday extra flags were tried and **reverted** — trees still followed `lag_48` on the day after a bank holiday.
+Features: calendar + UK holidays, HDD/CDD (15.5 °C), weather trajectory (past rolls + **forward** 12h/24h on the forecast path). Hour also uses lags 1/2. Day uses 48/336. Week v3 drops yesterday (`lag_48`) and adds `temp_delta_7d`, 14-day / 3-week demand extras. Climatology fills only 48/336. Holiday extra flags were tried and **reverted** — trees still followed `lag_48` on the day after a bank holiday. Later day-pack experiments (yesterday deltas, 24h deltas, MAE+tail quantiles) sit under `notebooks/day/` and were **not** promoted: live freeze MAE was worse than production.
 
 Eval: 56-day holdout at display frequency; WRMSSE vs weekly seasonal naive (1.0 = copy last week); skill vs climatology; SHAP on mean/P10/P90 of the pack that scored the row; case notebook for holiday / clock-change / hot day.
+
+**Optuna + W&B:** `notebooks/06_optuna.ipynb` sets `PRODUCT` to `next_hour`, `short`, or `medium` (run Search once per pack). Studies resume from `data/processed/optuna_{product}.db`. Install `pip install -e ".[tracking]"`, `wandb login`, leave `USE_WANDB = True`. One W&B run per pack in project `energy-forecast` (group = product). Charts: MAE vs trial. Table `optuna_trials`: every iteration. After a study, `write_optuna_snapshot()` refreshes `data/models/optuna_studies.json` for the models tab. Point Railway at the project with `WANDB_PROJECT_URL`.
 
 ---
 
 ## 4. Live scoring and safety
 
 - **Frozen feature parquet** at issue: weather, lags, last INDO. Day/week overwrites are the trial; week re-issue requires `WEEK_REISSUE_PASSWORD`.
-- **Context INDO** (`data/live/context_actuals.parquet`): last week of published outturn, written on the capture loop so a cold volume still shows yesterday / last week as the grey line. `GET /board` only reads the file.
+- **Context INDO** (`data/live/context_actuals.parquet`): last week of published outturn, written on the capture loop so a cold volume still shows yesterday / last week as the grey line. `GET /board` and `GET /shap` only read local files.
 - Hour pack **stamps `lag_1`/`lag_2` from Insights** immediately before predict. If last INDO is older than 90 minutes, skip the 30-minute call.
 - Capture at **:10 and :40** so the previous SP is usually published.
 
@@ -110,9 +116,10 @@ Eval: 56-day holdout at display frequency; WRMSSE vs weekly seasonal naive (1.0 
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/` | Dashboard |
+| GET | `/` | Dashboard (live board + **How the models work**) |
 | GET | `/health` | Railway healthcheck |
-| GET | `/board` | Fast JSON |
+| GET | `/board` | Fast JSON; **no Insights/Open-Meteo** |
+| GET | `/shap` | Mean-tree SHAP from frozen rows; **no weather APIs** |
 | GET | `/download/{preset}` | Forecast CSV |
 | GET | `/download/{preset}/frozen` | Frozen inputs |
 | GET | `/inputs/{preset}` | Input check (may hit Insights) |
@@ -130,10 +137,10 @@ Eval: 56-day holdout at display frequency; WRMSSE vs weekly seasonal naive (1.0 
 1. New project → Deploy from GitHub repo.
 2. Builder: Dockerfile (`railway.toml`).
 3. Volume mount `data/live` (and optionally `data/processed`) so the board survives deploys.
-4. Variables: `WEEK_REISSUE_PASSWORD`, optional `LIVE_TOKEN`, optional `WANDB_PROJECT_URL` / `MLFLOW_UI_URL` (lab column links), `PORT` (Railway injects this).
+4. Variables: `WEEK_REISSUE_PASSWORD`, optional `LIVE_TOKEN`, optional `WANDB_PROJECT_URL` (models-tab W&B link), `PORT` (Railway injects this).
 5. Healthcheck: `GET /health`.
 
-First capture on a cold box fetches weather and is slow. The **website** stays fast because `/` and `/board` do not wait on that.
+First capture on a cold box fetches weather and is slow. The **website** stays fast because `/`, `/board`, and `/shap` do not wait on that.
 
 Local:
 
@@ -168,6 +175,8 @@ docker compose up --build
 src/energy_forecast/    library + FastAPI app
 tests/                  pytest (no live APIs)
 notebooks/              EDA → train → eval → Optuna → SHAP → cases
+notebooks/day/          day pack experiments (v1–v4)
+notebooks/week/         week pack experiments (v1–v3)
 docs/                   README figures (live board screenshot)
 data/models/            committed artefacts
 data/raw/               NESO ND CSVs

@@ -7,13 +7,11 @@
   ],
   "features": [
     "settlement_period",
-    "hour",
     "minute",
     "day_of_week",
     "month",
     "is_weekend",
     "is_holiday",
-    "period_sin",
     "period_cos",
     "month_sin",
     "month_cos",
@@ -41,18 +39,29 @@
     "cdd_sum_72h",
     "cold_frac_72h",
     "hot_frac_72h",
-    "demand_lag_48",
-    "demand_lag_336"
+    "demand_lag_336",
+    "temp_delta_7d",
+    "temp_mean_24h_delta_7d",
+    "apparent_temp_delta_7d",
+    "hdd_delta_7d",
+    "cdd_delta_7d",
+    "shortwave_delta_7d",
+    "wind_delta_7d",
+    "cloud_delta_7d",
+    "shortwave_mean_24h",
+    "wind_mean_24h",
+    "demand_lag_672",
+    "demand_delta_14d_7d",
+    "demand_mean_3w",
+    "demand_accel_3w"
   ],
   "residual_features": [
     "settlement_period",
-    "hour",
     "minute",
     "day_of_week",
     "month",
     "is_weekend",
     "is_holiday",
-    "period_sin",
     "period_cos",
     "month_sin",
     "month_cos",
@@ -80,23 +89,36 @@
     "cdd_sum_72h",
     "cold_frac_72h",
     "hot_frac_72h",
-    "demand_lag_48",
     "demand_lag_336",
+    "temp_delta_7d",
+    "temp_mean_24h_delta_7d",
+    "apparent_temp_delta_7d",
+    "hdd_delta_7d",
+    "cdd_delta_7d",
+    "shortwave_delta_7d",
+    "wind_delta_7d",
+    "cloud_delta_7d",
+    "shortwave_mean_24h",
+    "wind_mean_24h",
+    "demand_lag_672",
+    "demand_delta_14d_7d",
+    "demand_mean_3w",
+    "demand_accel_3w",
     "mean_pred"
   ],
   "regions": [
     "gb"
   ],
   "interval_scale": {
-    "gb": 1.1873959302902222
+    "gb": 1.0123336911201477
   },
   "target_coverage": 0.8,
-  "trained_at": "2026-09-26T12:08:26.460740+00:00",
+  "trained_at": "2026-10-06T15:01:25.019713+00:00",
   "n_estimators": 450,
-  "n_train": 359800,
+  "n_train": 360952,
   "role": "week",
-  "holdout_start": "2026-07-26 00:30:00+01:00",
-  "n_holdout": 21512,
+  "holdout_start": "2026-08-05 00:30:00+01:00",
+  "n_holdout": 20744,
   "exclude_years": [
     2020,
     2021,
@@ -109,6 +131,9 @@
     "num_leaves": 19,
     "min_child_samples": 61,
     "subsample": 0.781673112232677,
-    "colsample_bytree": 0.6385450911486689
-  }
+    "colsample_bytree": 0.65,
+    "feature_fraction": 0.65
+  },
+  "long_lags_only": true,
+  "engineered_week": true
 }

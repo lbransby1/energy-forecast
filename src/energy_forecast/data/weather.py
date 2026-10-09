@@ -168,6 +168,88 @@ def load_cached_weather(
     return weather
 
 
+ARCHIVE_EXTEND_LAG_DAYS = 5
+
+
+def extend_cached_archive(
+    region_ids: list[str] | None = None,
+    *,
+    end_date: str | None = None,
+    lag_days: int = ARCHIVE_EXTEND_LAG_DAYS,
+    processed_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Fetch ERA5 days after the local cache and append them. Older years stay on disk."""
+    region_ids = region_ids or [SERIES_ID]
+    processed_dir = processed_dir or DATA_PROCESSED
+    frames = [
+        _extend_region_archive(
+            region_id,
+            end_date=end_date,
+            lag_days=lag_days,
+            processed_dir=processed_dir,
+        )
+        for region_id in region_ids
+    ]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _extend_region_archive(
+    region_id: str,
+    *,
+    end_date: str | None,
+    lag_days: int,
+    processed_dir: Path,
+) -> pd.DataFrame:
+    path = _cache_path(processed_dir, region_id, "archive")
+    if not path.exists():
+        raise FileNotFoundError(f"Weather cache missing for {region_id} under {processed_dir}.")
+    cached = pd.read_parquet(path)
+    cached["timestamp"] = pd.to_datetime(cached["timestamp"], utc=True).dt.tz_convert(LONDON_TZ)
+    cached["settlement_date"] = pd.to_datetime(cached["settlement_date"]).dt.tz_localize(None).dt.normalize()
+    now_london = pd.Timestamp.now(tz=LONDON_TZ)
+    target_end = pd.Timestamp(end_date).normalize() if end_date else (
+        pd.Timestamp(now_london.date()) - pd.Timedelta(days=int(lag_days))
+    )
+    cache_end = pd.Timestamp(cached["settlement_date"].max()).normalize()
+    if cache_end >= target_end:
+        return cached
+    start_date = cache_end.strftime("%Y-%m-%d")
+    added = _fetch_archive_window(region_id, start_date=start_date, end_date=target_end)
+    if added is None or added.empty:
+        return cached
+    combined = pd.concat([cached, added], ignore_index=True)
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"], utc=True).dt.tz_convert(LONDON_TZ)
+    combined = combined.drop_duplicates(["region_id", "timestamp"], keep="last").sort_values("timestamp")
+    combined["settlement_date"] = pd.to_datetime(combined["settlement_date"]).dt.tz_localize(None).dt.normalize()
+    combined.to_parquet(path, index=False)
+    logger.info("Extended weather cache %s through %s", path, combined["settlement_date"].max())
+    return combined
+
+
+def _fetch_archive_window(region_id: str, *, start_date: str, end_date: pd.Timestamp) -> pd.DataFrame | None:
+    region = get_series(region_id)
+    cursor = pd.Timestamp(end_date).normalize()
+    start = pd.Timestamp(start_date).normalize()
+    last_error: Exception | None = None
+    while cursor >= start:
+        try:
+            hourly = _fetch_region_hourly(
+                region,
+                source="archive",
+                start_date=start_date,
+                end_date=cursor.strftime("%Y-%m-%d"),
+                forecast_days=7,
+            )
+            return align_hourly_to_settlement(hourly, region_id=region_id)
+        except (WeatherAPIError, requests.RequestException, ValueError) as exc:
+            last_error = exc
+            logger.warning("ERA5 archive through %s failed (%s); trying one day earlier", cursor.date(), exc)
+            cursor = cursor - pd.Timedelta(days=1)
+    if last_error:
+        logger.warning("Could not extend ERA5 archive from %s: %s", start_date, last_error)
+    return None
+
+
 def combine_archive_and_forecast(archive: pd.DataFrame, forecast: pd.DataFrame) -> pd.DataFrame:
     """ERA5 through its last timestamp, then the operational forecast after that.
 

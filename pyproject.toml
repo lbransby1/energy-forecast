@@ -28,6 +28,9 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
 ]
+tracking = [
+    "wandb>=0.19",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

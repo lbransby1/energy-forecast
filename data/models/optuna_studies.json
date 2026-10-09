@@ -1,42 +1,47 @@
 {
+  "next_hour": {
+    "product": "next_hour",
+    "ready": true,
+    "n_trials": 120,
+    "n_complete": 120,
+    "best_mae": 261.7350542616679,
+    "best_params": {
+      "colsample_bytree": 0.9977886492180295,
+      "learning_rate": 0.06572809310323258,
+      "min_child_samples": 67,
+      "n_estimators": 500,
+      "num_leaves": 92,
+      "subsample": 0.8802539290826998
+    }
+  },
   "short": {
     "product": "short",
-    "ready": false,
-    "n_trials": 0,
-    "n_complete": 0,
-    "best_mae": null,
-    "best_params": null
+    "ready": true,
+    "n_trials": 100,
+    "n_complete": 100,
+    "best_mae": 841.0911436785484,
+    "best_params": {
+      "colsample_bytree": 0.6235476485104684,
+      "learning_rate": 0.05154938259471686,
+      "min_child_samples": 62,
+      "n_estimators": 450,
+      "num_leaves": 45,
+      "subsample": 0.8084151420110467
+    }
   },
   "medium": {
     "product": "medium",
-    "study_name": "medium_mae",
     "ready": true,
-    "n_trials": 50,
-    "n_complete": 50,
-    "best_mae": 879.3552690481054,
+    "n_trials": 100,
+    "n_complete": 100,
+    "best_mae": 902.9835644235428,
     "best_params": {
-      "colsample_bytree": 0.6385450911486689,
-      "learning_rate": 0.022965408930055223,
-      "min_child_samples": 61,
-      "n_estimators": 450,
-      "num_leaves": 19,
-      "subsample": 0.781673112232677
-    }
-  },
-  "next_hour": {
-    "product": "next_hour",
-    "study_name": "next_hour_mae",
-    "ready": true,
-    "n_trials": 20,
-    "n_complete": 20,
-    "best_mae": 264.4143529835632,
-    "best_params": {
-      "colsample_bytree": 0.9579950564911175,
-      "learning_rate": 0.03982989749645549,
-      "min_child_samples": 50,
-      "n_estimators": 500,
-      "num_leaves": 94,
-      "subsample": 0.7114944926320207
+      "colsample_bytree": 0.7825141536620359,
+      "learning_rate": 0.09751185070782244,
+      "min_child_samples": 53,
+      "n_estimators": 150,
+      "num_leaves": 18,
+      "subsample": 0.7708473067989509
     }
   }
 }

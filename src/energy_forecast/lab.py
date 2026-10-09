@@ -28,7 +28,7 @@ PACKS = (
         "label": "Next week",
         "dir": DATA_MODELS,
         "search": "medium",
-        "note": "All leads. Production trees are the medium Optuna winner.",
+        "note": "Monday freeze, no lag_48. Week-over-week weather and 14-day / 3-week demand extras. Direct predict.",
     },
 )
 
@@ -135,6 +135,8 @@ def _optuna_from_sqlite(product: str) -> dict:
             "best_mae": float(best.value) if best is not None and best.value is not None else None,
             "best_params": params,
         }
+    except KeyError:
+        return base
     except Exception:  # noqa: BLE001
         return {**base, "error": "study file present but could not be read"}
 
@@ -151,11 +153,9 @@ def _optuna_snapshot(product: str) -> dict:
 
 def tracking_links() -> dict:
     wandb = (os.environ.get("WANDB_PROJECT_URL") or os.environ.get("WANDB_URL") or "").strip()
-    mlflow = (os.environ.get("MLFLOW_UI_URL") or "").strip()
     notebook = (os.environ.get("OPTUNA_NOTEBOOK_URL") or DEFAULT_NOTEBOOK).strip()
     return {
         "wandb": wandb or None,
-        "mlflow": mlflow or None,
         "notebook": notebook or None,
     }
 
@@ -169,3 +169,11 @@ def model_lab_payload() -> dict:
         "optuna": searches,
         "tracking": tracking_links(),
     }
+
+
+def write_optuna_snapshot(products: tuple[str, ...] = ("next_hour", "short", "medium")) -> Path:
+    """Write sqlite study summaries into ``data/models`` for the live lab column."""
+    payload = {name: _optuna_from_sqlite(name) for name in products}
+    path = DATA_MODELS / "optuna_studies.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path

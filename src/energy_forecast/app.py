@@ -9,7 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from energy_forecast.live import (
     NEXT30,
@@ -111,6 +111,17 @@ def score() -> dict:
         "n": int(len(scored)),
         "rows": _frame_records(scored.sort_values("timestamp"), limit=400),
     }
+
+
+@app.get("/shap")
+def shap() -> JSONResponse:
+    """Mean-tree SHAP for hour, day, and week. Frozen parquet + models only."""
+    try:
+        from energy_forecast.explain import shap_dashboard_payload
+
+        return JSONResponse(shap_dashboard_payload(), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/board")
@@ -259,20 +270,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .swatch.red { background: #c45c26; height: 5px; }
     .swatch.blue { background: #9bb8d3; }
     .panel { background: #fff; border: 1px solid #ddd4c4; padding: 14px 16px 10px; margin: 0; }
-    .board { display: grid; grid-template-columns: 1fr 1fr minmax(280px, 24rem); grid-template-areas: "week week side" "day n30 side"; gap: 14px; align-items: start; margin: 14px 0; }
-    .side { grid-area: side; display: flex; flex-direction: column; gap: 14px; }
+    .board { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "week week" "day n30"; gap: 14px; align-items: start; margin: 14px 0; }
     .panel.week { grid-area: week; }
     .panel.day { grid-area: day; }
     .panel.n30 { grid-area: n30; }
-    .eval .cards, .lab .cards { margin-top: 8px; }
     table.eval-miss, table.audit, table.lab-packs { font-variant-numeric: lining-nums tabular-nums; }
     table.eval-miss, table.lab-packs { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 8px; }
     table.eval-miss th, table.eval-miss td, table.lab-packs th, table.lab-packs td { text-align: left; padding: 4px 5px; border-bottom: 1px solid #eee; }
+    table.eval-miss tfoot td { font-weight: 600; border-top: 1px solid #ccc; }
+    details.fold { margin: 8px 0 4px; border-top: 1px solid #eee; padding-top: 8px; }
+    details.fold summary { cursor: pointer; font-weight: 600; font-size: 0.92rem; }
+    details.fold .cards { margin-top: 8px; }
+    details.fold.intro { border-top: none; padding-top: 0; margin: 8px 0 12px; }
+    .shap-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; align-items: start; margin-top: 14px; }
+    .shap-row .models-pack { margin: 0; min-width: 0; }
+    .shap-row .lab-packs { font-size: 0.75rem; }
     @media (max-width: 1100px) {
-      .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30" "side"; }
+      .board { grid-template-columns: 1fr; grid-template-areas: "week" "day" "n30"; }
+      .shap-row { grid-template-columns: 1fr; }
     }
     .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline; }
-    .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 6px; }
+    .cards { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 8px; }
+    .score-label { font-size: 0.8rem; font-weight: 600; color: #5c5c5c; margin: 10px 0 0; }
+    .cards.holdout .card { background: #faf8f4; }
     .card { border: 1px solid #eee; padding: 8px 10px; min-width: 110px; min-height: 4.1rem; cursor: help; display: flex; flex-direction: column; justify-content: space-between; }
     .card b { display: block; font-size: 1.05rem; font-weight: 600; line-height: 1.25; letter-spacing: 0; white-space: nowrap; font-variant-numeric: lining-nums tabular-nums; }
     .links a { margin-right: 12px; color: #1a1a1a; }
@@ -287,37 +307,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .warn { color: #8b1e1e; }
     .ok { color: #1a5c38; }
     table.audit { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }
-    table.audit th, table.audit td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; }
+    .models-pack h3 { margin: 0 0 6px; font-size: 1.05rem; }
+    button.active-view { font-weight: 600; }
+    @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <h1>Grid Demand UK</h1>
-  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. There are three&nbsp;views of the forecast (week, day, half-hour), a check on finished half-hours, and a lab column for holdout scores and search. Times are UK. The black line is only drawn after each half-hour has ended.</p>
+  <p class="lede">How much electricity Great Britain is using, and what this site guessed before the official figure was published. Three&nbsp;views of the forecast (week, day, half-hour). Scores, how this freeze did, and the half-hour INDO lag check sit in dropdowns under each chart. Training and SHAP live on the models tab. The project is complete. Times are UK. The black line is only drawn after each half-hour has ended.</p>
   <p class="key" aria-label="Chart colour key">
     <span><i class="swatch black"></i> Black — what actually happened (official grid outturn)</span>
     <span><i class="swatch red"></i> Red — the central forecast (most likely demand)</span>
     <span><i class="swatch blue"></i> Blue — a likely range (low to high). The black line should usually sit between them.</span>
   </p>
-  <dl class="glossary" aria-label="Score cards">
-    <dt>n</dt>
-    <dd>How many half-hours already have an official number, so they can be scored. “Waiting” means none yet.</dd>
-    <dt>MAE</dt>
-    <dd>Typical size of the miss, in megawatts. Average of how far the red line was from the black line. Lower is better.</dd>
-    <dt>WRMSSE</dt>
-    <dd>Error compared with copying last week. <b>1.0</b> = as good as paste-last-week. Below 1 beats that. Above 1 is worse.</dd>
-    <dt>Coverage</dt>
-    <dd>How often the black line landed between the two blue lines. About 80% is the aim.</dd>
-    <dt>Bias</dt>
-    <dd>On average, is the red line too high (positive) or too low (negative), in megawatts.</dd>
-    <dt>Width</dt>
-    <dd>Average gap between the two blue lines across the <b>whole issued forecast</b> (including hours that have not finished yet). The week fan is meant to get wider later in the week, so that pulls this number up. MAE and coverage still use only finished half-hours (<b>n</b>).</dd>
-  </dl>
+  <details class="fold intro">
+    <summary>What the scores mean</summary>
+    <dl class="glossary" aria-label="Score cards">
+      <dt>This freeze</dt>
+      <dd>Scores for the forecast on the chart: only half-hours that already have a black official number.</dd>
+      <dt>Holdout</dt>
+      <dd>The last train’s validation window (about eight weeks). A different sample from the live freeze — that is the lab score, not today’s board.</dd>
+      <dt>n</dt>
+      <dd>How many half-hours already have an official number, so they can be scored. “Waiting” means none yet. On the holdout row it is the size of that train window.</dd>
+      <dt>MAE</dt>
+      <dd>Typical size of the miss, in megawatts. Average of how far the red line was from the black line. Lower is better.</dd>
+      <dt>WRMSSE</dt>
+      <dd>Error compared with copying last week. <b>1.0</b> = as good as paste-last-week. Below 1 beats that. Above 1 is worse.</dd>
+      <dt>Coverage</dt>
+      <dd>How often the black line landed between the two blue lines. About 80% is the aim.</dd>
+      <dt>Bias</dt>
+      <dd>Mean of official demand minus the red line. <b>Negative</b> means the guess was too high. Positive means it was too low.</dd>
+      <dt>Width</dt>
+      <dd>Average gap between the two blue lines across the <b>whole issued forecast</b> (including hours that have not finished yet). The week fan is meant to get wider later in the week, so that pulls this number up. MAE and coverage still use only finished half-hours (<b>n</b>).</dd>
+    </dl>
+  </details>
   <p>
+    <button type="button" id="view-live" class="active-view">Live board</button>
+    <button type="button" id="view-models">How the models work</button>
     <button type="button" id="reload">Reload board</button>
     <button type="button" id="capture">Issue due presets</button>
     <span class="muted" id="note">Loading board…</span>
   </p>
 
+  <div id="live-view">
   <div class="board">
   <section class="panel week">
     <div class="head">
@@ -332,39 +364,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <a href="/download/week/frozen?which=previous">Previous inputs</a>
       </div>
     </div>
-    <p class="explain">This chart is the last two days of last week (Saturday and Sunday), then this week from Monday, in time order. That keeps this week’s half-hours readable. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Scores in the boxes only use hours of this week that already have a black line.</p>
-    <div class="cards" id="week-cards"></div>
+    <p class="explain">This chart is the last two days of last week (Saturday and Sunday), then this week from Monday, in time order. That keeps this week’s half-hours readable. If last week’s Monday freeze is still on disk, the pale lines are that forecast against the black official numbers. From this Monday the bright lines are this week’s forecast. Open <b>Scores</b> for this freeze vs holdout.</p>
     <button type="button" data-preset="week">Re-issue week (password)</button>
     <div class="chart-wrap week"><canvas id="week"></canvas></div>
+    <details class="fold">
+      <summary>Scores</summary>
+      <p class="explain"><b>This freeze</b> scores only hours of this week that already have a black line. <b>Holdout</b> is the last train, not this week.</p>
+      <p class="score-label">This freeze</p>
+      <div class="cards" id="week-cards"></div>
+      <p class="score-label">Holdout (last train)</p>
+      <div class="cards holdout" id="week-holdout"></div>
+    </details>
+    <details class="fold">
+      <summary>How this freeze did <span class="muted" id="week-eval-note"></span></summary>
+      <p class="explain">Finished half-hours on this chart only. <b>Outside band</b> — actual missed the blue range. <b>Lags</b> — the demand reading at issue did not match the official figure. <b>Large miss</b> — red line more than about 1.5 GW out, but still inside the blues.</p>
+      <div class="cards" id="week-eval-cards"></div>
+      <table class="eval-miss" id="week-eval-miss"></table>
+    </details>
   </section>
-
-  <div class="side">
-  <section class="panel eval" id="eval">
-    <div class="head">
-      <div>
-        <h2>How the guesses did</h2>
-        <p class="muted" id="eval-note">Finished half-hours only.</p>
-      </div>
-    </div>
-    <p class="explain">This column is a check, not a new forecast. It looks at half-hours that already have a black line and tags the awkward ones. <b>Outside band</b> — actual missed the blue range (a spike the guess did not cover). <b>Lags</b> — the demand reading the half-hour model used did not match the official figure at issue time (a labelling / freshness problem). <b>Large miss</b> — red line was more than about 1.5 GW out, but still inside the blues. Weather-was-wrong is not scored here yet; that needs a few days of issued temperature vs later actual weather.</p>
-    <div class="cards" id="eval-cards"></div>
-    <p class="muted" id="eval-weather"></p>
-    <table class="eval-miss" id="eval-miss"></table>
-  </section>
-
-  <section class="panel lab" id="lab">
-    <div class="head">
-      <div>
-        <h2>How the models were trained</h2>
-        <p class="muted" id="lab-note">Holdout scores from the last train, not today’s board.</p>
-      </div>
-    </div>
-    <p class="explain">This column is the research trail. <b>Holdout MAE</b> is the last eight weeks used when the pack was fit — a different sample from the live n on the charts. <b>Tuned</b> means Optuna settings were written into that pack. The week pack has a search winner; the 24-hour pack still uses stock LightGBM. Trial counts come from the last exported Optuna snapshot shipped with the models. Weights &amp; Biases and MLflow links appear when those URLs are set on the server.</p>
-    <p class="links" id="lab-links"></p>
-    <table class="lab-packs" id="lab-packs"></table>
-    <table class="lab-packs" id="lab-optuna"></table>
-  </section>
-  </div>
 
   <section class="panel day">
       <div class="head">
@@ -378,10 +395,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/download/day?which=previous">Yesterday forecast CSV</a>
         </div>
       </div>
-      <p class="explain">The left side is yesterday’s London calendar day, from the first stored half-hour until midnight. A late freeze (for example issued at 9am) still stops at midnight; it does not run into today. From midnight the bright lines are today’s forecast. Scores in the boxes are for today.</p>
-      <div class="cards" id="day-cards"></div>
+      <p class="explain">The left side is yesterday’s London calendar day, from the first stored half-hour until midnight. A late freeze (for example issued at 9am) still stops at midnight; it does not run into today. From midnight the bright lines are today’s forecast. Open <b>Scores</b> for today vs holdout.</p>
       <button type="button" data-preset="day">Re-issue day</button>
       <div class="chart-wrap half"><canvas id="day"></canvas></div>
+      <details class="fold">
+        <summary>Scores</summary>
+        <p class="explain"><b>This freeze</b> is today. <b>Holdout</b> is the last train, not this morning.</p>
+        <p class="score-label">This freeze</p>
+        <div class="cards" id="day-cards"></div>
+        <p class="score-label">Holdout (last train)</p>
+        <div class="cards holdout" id="day-holdout"></div>
+      </details>
+      <details class="fold">
+        <summary>How this freeze did <span class="muted" id="day-eval-note"></span></summary>
+        <p class="explain">Finished half-hours on this chart only. <b>Outside band</b> — actual missed the blue range. <b>Lags</b> — the demand reading at issue did not match the official figure. <b>Large miss</b> — red line more than about 1.5 GW out, but still inside the blues.</p>
+        <div class="cards" id="day-eval-cards"></div>
+        <table class="eval-miss" id="day-eval-miss"></table>
+      </details>
   </section>
   <section class="panel n30">
       <div class="head">
@@ -395,20 +425,79 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <a href="/inputs/next30">Input check JSON</a>
         </div>
       </div>
-      <p class="explain">This chart is the last six hours, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Pale red is what was written at the time. Dots are the live guess still waiting.</p>
-      <div class="cards" id="n30-cards"></div>
+      <p class="explain">This chart is the last six hours, one guess per half-hour. The guess labelled 1:30 is for 1:00–1:30, and the black official number for that half-hour is drawn at 1:30 too (Insights stores it at 1:00). Pale red is what was written at the time. Dots are the live guess still waiting. Open <b>Scores</b> for this freeze vs holdout, and <b>INDO lag check</b> for the demand readings the model used.</p>
       <button type="button" data-preset="next30">Re-issue next 30</button>
       <div class="chart-wrap half"><canvas id="next30"></canvas></div>
-      <dl class="glossary" aria-label="Next 30 minute extra cards">
-        <dt>Target</dt>
-        <dd>The end of the half-hour being guessed. 1:30 means 1:00–1:30, matching the black line.</dd>
-        <dt>Live P50</dt>
-        <dd>The current red-line guess, in megawatts, for that target half-hour.</dd>
-      </dl>
-      <p class="explain">Logs for the half-hour model sit under the chart so it lines up with today. The status line is a health check on the latest guess: last official outturn (and how old it is), the two most recent demand readings the model was given, and UK temperature. Green means those look complete; red means the guess was skipped or the inputs look wrong. The table is a short history. <b>lag_1</b> is the latest demand the model used; <b>INDO then</b> is the official figure available at issue time; <b>stale lags</b> means those two disagreed, so the guess may be off.</p>
-      <p class="muted" id="n30-inputs"></p>
-      <table class="audit" id="n30-audit"></table>
+      <details class="fold">
+        <summary>Scores</summary>
+        <p class="explain"><b>This freeze</b> is those finished half-hours. <b>Holdout</b> is the last train.</p>
+        <p class="score-label">This freeze</p>
+        <div class="cards" id="n30-cards"></div>
+        <p class="score-label">Holdout (last train)</p>
+        <div class="cards holdout" id="n30-holdout"></div>
+        <dl class="glossary" aria-label="Next 30 minute extra cards">
+          <dt>Target</dt>
+          <dd>The end of the half-hour being guessed. 1:30 means 1:00–1:30, matching the black line.</dd>
+          <dt>Live P50</dt>
+          <dd>The current red-line guess, in megawatts, for that target half-hour.</dd>
+        </dl>
+      </details>
+      <details class="fold">
+        <summary>How this freeze did <span class="muted" id="n30-eval-note"></span></summary>
+        <p class="explain">Finished half-hours on this chart only. <b>Outside band</b> — actual missed the blue range. <b>Lags</b> — the demand reading at issue did not match the official figure. <b>Large miss</b> — red line more than about 1.5 GW out, but still inside the blues. <b>Stale share</b> is how often lag_1 disagreed with INDO on recent issues.</p>
+        <div class="cards" id="n30-eval-cards"></div>
+        <table class="eval-miss" id="n30-eval-miss"></table>
+      </details>
+      <details class="fold">
+        <summary>INDO lag check</summary>
+        <p class="explain">The status line is a health check on the latest guess: last official outturn (and how old it is), the two most recent demand readings the model was given, and UK temperature. Green means those look complete; red means the guess was skipped or the inputs look wrong. The table is a short history. <b>lag_1</b> is the latest demand the model used; <b>INDO then</b> is the official figure available at issue time; <b>stale lags</b> means those two disagreed, so the guess may be off.</p>
+        <p class="muted" id="n30-inputs"></p>
+        <table class="audit" id="n30-audit"></table>
+      </details>
   </section>
+  </div>
+  </div>
+
+  <div id="models-view" hidden>
+    <p class="explain">This site is <b>finished</b>. A forecast is written first, stored frozen, then scored when Elexon Insights publishes INDO for that half-hour. Holdout MAE is not the live score; the board is.</p>
+    <p class="explain">Three LightGBM packs, routed by lead. Each pack is two-phase: a <b>mean</b> tree (the red line / P50 story), then <b>P10 and P90</b> quantile trees on that mean. A post-hoc <code>interval_scale</code> stretches the blue band toward 80% coverage. Features live in <code>features.py</code>: calendar and UK holidays, HDD/CDD at 15.5°C, weather trajectory (past rolls and forward 12h/24h on the issued path), and demand lags. COVID years 2020–2023 stay out of day/week training. Day/week weather in train is Previous Runs — what would have been available at issue — not perfect ERA5.</p>
+    <p class="explain"><b>Hour</b> uses ERA5 and the last two INDO prints. <b>Day</b> freezes at midnight London with yesterday known. <b>Week</b> freezes Monday with no yesterday for most of the horizon, week-over-week weather, and a direct (not recursive) predict. <code>GET /board</code> and this tab never call Open-Meteo; they read local parquet and the committed trees.</p>
+    <section class="panel" id="lab">
+      <div class="head">
+        <div>
+          <h2>How the models were trained</h2>
+          <p class="muted" id="lab-note">Holdout scores from the last train, not today’s board.</p>
+        </div>
+      </div>
+      <p class="explain"><b>Holdout</b> is the last eight weeks used when the pack was fit. <b>This freeze MAE</b> is the live chart score — a different sample. Trial counts come from the last exported Optuna snapshot shipped with the models. A Weights &amp; Biases link appears when <code>WANDB_PROJECT_URL</code> is set on the server.</p>
+      <p class="links" id="lab-links"></p>
+      <table class="lab-packs" id="lab-packs"></table>
+      <table class="lab-packs" id="lab-optuna"></table>
+    </section>
+    <p class="muted" id="models-note"></p>
+    <div class="shap-row">
+    <section class="panel models-pack">
+      <h3>Next week</h3>
+      <p class="explain" id="shap-week-how"></p>
+      <p class="muted" id="shap-week-note"></p>
+      <table class="lab-packs" id="shap-week-sources"></table>
+      <table class="lab-packs" id="shap-week-rank"></table>
+    </section>
+    <section class="panel models-pack">
+      <h3>Next 24 hours</h3>
+      <p class="explain" id="shap-day-how"></p>
+      <p class="muted" id="shap-day-note"></p>
+      <table class="lab-packs" id="shap-day-sources"></table>
+      <table class="lab-packs" id="shap-day-rank"></table>
+    </section>
+    <section class="panel models-pack">
+      <h3>Next 30 minutes</h3>
+      <p class="explain" id="shap-hour-how"></p>
+      <p class="muted" id="shap-hour-note"></p>
+      <table class="lab-packs" id="shap-hour-sources"></table>
+      <table class="lab-packs" id="shap-hour-rank"></table>
+    </section>
+    </div>
   </div>
 
   <script src="/chart.js"></script>
@@ -495,6 +584,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       catch { throw new Error(text.slice(0, 180) || res.statusText); }
     }
 
+    function packById(lab, id) {
+      return ((lab && lab.packs) || []).find((row) => row.id === id) || {};
+    }
+
     function cards(el, metrics, extra) {
       const m = metrics || {};
       el.innerHTML = `
@@ -503,13 +596,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="card" title="Typical size of the miss, in megawatts. Lower is better."><span class="muted">MAE</span><b>${m.mae != null ? fmt(m.mae) + " MW" : "waiting"}</b></div>
         <div class="card" title="Compared with copying last week. 1.0 = copy last week. Below 1 is better."><span class="muted">WRMSSE</span><b>${m.wrmsse != null ? Number(m.wrmsse).toFixed(2) : "—"}</b></div>
         <div class="card" title="How often the black line landed between the two blue lines. About 80% is the aim."><span class="muted">Coverage</span><b>${m.coverage_80 != null ? (100*m.coverage_80).toFixed(0) + "%" : "waiting"}</b></div>
-        <div class="card" title="On average, is the red line too high (positive) or too low (negative)."><span class="muted">Bias</span><b>${m.bias != null ? fmt(m.bias) + " MW" : "—"}</b></div>
+        <div class="card" title="Actual minus guess. Negative means the red line was too high."><span class="muted">Bias</span><b>${m.bias != null ? fmt(m.bias) + " MW" : "—"}</b></div>
         <div class="card" title="Average gap between the blue lines over the whole issued forecast, including hours still to come."><span class="muted">Width</span><b>${m.interval_width != null ? fmt(m.interval_width) + " MW" : "—"}</b></div>`;
     }
 
-    function lineChart(id, labels, datasets, title, mode) {
+    function holdoutCards(el, pack) {
+      if (!el) return;
+      const m = pack || {};
+      el.innerHTML = `
+        <div class="card" title="Half-hours in the last train holdout. Not this freeze."><span class="muted">n</span><b>${m.n_holdout != null ? fmt(m.n_holdout) : "—"}</b></div>
+        <div class="card" title="Holdout MAE from the last train. A different sample from the freeze cards above."><span class="muted">MAE</span><b>${m.holdout_mae != null ? fmt(m.holdout_mae) + " MW" : "—"}</b></div>
+        <div class="card" title="Holdout share of actuals inside the P10–P90 band. About 80% is the aim."><span class="muted">Coverage</span><b>${m.holdout_coverage != null ? (100 * m.holdout_coverage).toFixed(0) + "%" : "—"}</b></div>`;
+    }
+
+    function lineChart(id, labels, datasets, title, mode, yTitle) {
       if (charts[id]) charts[id].destroy();
-      charts[id] = new Chart(document.getElementById(id), {
+      const el = document.getElementById(id);
+      if (!el) return;
+      charts[id] = new Chart(el, {
         type: "line",
         data: { labels, datasets },
         options: {
@@ -541,7 +645,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               } }
             },
             y: {
-              title: { display: true, text: "MW", font: { size: 11 } },
+              title: { display: true, text: yTitle || "MW", font: { size: 11 } },
               ticks: { font: { size: 11 }, color: "#444", callback: (v) => Number(v).toLocaleString() }
             }
           }
@@ -652,15 +756,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         ? ("Guessing " + london(live.timestamp) + " · written " + london(live.issued_at)
           + " · most likely " + fmt(live.p50) + " MW")
         : "Waiting for the first half-hour guess.";
+      const lab = board.lab || {};
       cards(document.getElementById("week-cards"), week.current && week.current.metrics);
+      holdoutCards(document.getElementById("week-holdout"), packById(lab, "week"));
       cards(document.getElementById("day-cards"), day.current && day.current.metrics,
         (day.previous && day.previous.metrics && day.previous.issued_at)
           ? `<div class="card" title="Yesterday’s freeze: typical miss once the day had finished."><span class="muted">Yesterday MAE</span><b>${day.previous.metrics.mae != null ? fmt(day.previous.metrics.mae) + " MW" : "—"}</b></div>`
           : "");
+      holdoutCards(document.getElementById("day-holdout"), packById(lab, "day"));
       cards(document.getElementById("n30-cards"), n30.metrics, live.timestamp
         ? `<div class="card" title="Which half-hour the guess is for."><span class="muted">Target</span><b>${london(live.timestamp)}</b></div>
            <div class="card" title="The current red-line guess for that half-hour, in megawatts."><span class="muted">Live P50</span><b>${fmt(live.p50)} MW</b></div>`
         : "");
+      holdoutCards(document.getElementById("n30-holdout"), packById(lab, "hour"));
       const inp = n30.inputs || {};
       const issues = inp.issues || [];
       const inputEl = document.getElementById("n30-inputs");
@@ -689,34 +797,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       drawWindow("day", day.previous, day.previous_actuals, day.current, dayTitle, "day", "Yesterday", stampMs(day.boundary || (day.current && day.current.window_start)));
       drawNext30(n30.history || [], live);
       drawEval(board.eval || {});
-      drawLab(board.lab || {});
+      drawLab(lab, {
+        hour: n30.metrics,
+        day: day.current && day.current.metrics,
+        week: week.current && week.current.metrics,
+      });
     }
 
-    function drawEval(ev) {
-      const scored = ev.scored || 0;
-      document.getElementById("eval-note").textContent = scored
-        ? (scored + " finished half-hours scored")
-        : "Waiting for official outturn on issued guesses.";
-      const cards = document.getElementById("eval-cards");
-      const stale = ev.stale_share != null ? (100 * ev.stale_share).toFixed(0) + "%" : "—";
+    function evalSlice(ev, preset) {
+      const by = ((ev && ev.by_preset) || {})[preset] || {};
+      const fallback = ((ev && ev.worst) || []).filter((row) => row.preset === preset);
+      return {
+        scored: by.scored || 0,
+        outside_band: by.outside_band || 0,
+        lags: by.lags || 0,
+        large_miss: by.large_miss || 0,
+        stale_share: preset === "next30" ? ev.stale_share : null,
+        worst: (by.worst && by.worst.length) ? by.worst : fallback,
+      };
+    }
+
+    function drawEvalPack(prefix, slice, withStale) {
+      const scored = slice.scored || 0;
+      const note = document.getElementById(prefix + "-eval-note");
+      if (note) {
+        note.textContent = scored
+          ? (" · " + scored + " finished half-hours")
+          : " · waiting for official numbers";
+      }
+      const cards = document.getElementById(prefix + "-eval-cards");
+      if (!cards) return;
+      const stale = slice.stale_share != null ? (100 * slice.stale_share).toFixed(0) + "%" : "—";
       cards.innerHTML = `
         <div class="card" title="Half-hours with both a guess and an official number."><span class="muted">Scored</span><b>${fmt(scored)}</b></div>
-        <div class="card" title="Actual missed the blue range."><span class="muted">Outside band</span><b>${fmt(ev.outside_band)}</b></div>
-        <div class="card" title="Half-hour model used a demand reading that did not match the official figure."><span class="muted">Lags</span><b>${fmt(ev.lags)}</b></div>
-        <div class="card" title="Red line more than about 1.5 GW out, but still inside the blues."><span class="muted">Large miss</span><b>${fmt(ev.large_miss)}</b></div>
-        <div class="card" title="Share of recent half-hour issues where lag_1 disagreed with INDO."><span class="muted">Stale share</span><b>${stale}</b></div>`;
-      const weather = document.getElementById("eval-weather");
-      weather.textContent = (ev.weather && ev.weather.note) || "";
-      const worst = ev.worst || [];
-      const table = document.getElementById("eval-miss");
+        <div class="card" title="Actual missed the blue range."><span class="muted">Outside band</span><b>${fmt(slice.outside_band)}</b></div>
+        <div class="card" title="The model used a demand reading that did not match the official figure."><span class="muted">Lags</span><b>${fmt(slice.lags)}</b></div>
+        <div class="card" title="Red line more than about 1.5 GW out, but still inside the blues."><span class="muted">Large miss</span><b>${fmt(slice.large_miss)}</b></div>
+        ${withStale ? `<div class="card" title="Share of recent half-hour issues where lag_1 disagreed with INDO."><span class="muted">Stale share</span><b>${stale}</b></div>` : ""}`;
+      const worst = slice.worst || [];
+      const table = document.getElementById(prefix + "-eval-miss");
+      if (!table) return;
       if (!worst.length) {
         table.innerHTML = "";
         return;
       }
-      table.innerHTML = "<thead><tr><th>When</th><th>View</th><th>Guess</th><th>Actual</th><th>Miss</th><th>Tag</th></tr></thead><tbody>"
+      table.innerHTML = "<thead><tr><th>When</th><th>Guess</th><th>Actual</th><th>Miss</th><th>Tag</th></tr></thead><tbody>"
         + worst.map((row) => `<tr>
             <td>${london(row.timestamp)}</td>
-            <td>${row.preset || ""}</td>
             <td>${fmt(row.p50)}</td>
             <td>${fmt(row.actual_mw)}</td>
             <td>${fmt(row.error_mw)}</td>
@@ -725,31 +852,96 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         + "</tbody>";
     }
 
-    function drawLab(lab) {
+    function drawEval(ev) {
+      drawEvalPack("week", evalSlice(ev, "week"), false);
+      drawEvalPack("day", evalSlice(ev, "day"), false);
+      drawEvalPack("n30", evalSlice(ev, "next30"), true);
+    }
+
+    function shapTable(id, rows) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (!rows || !rows.length) { el.innerHTML = ""; return; }
+      el.innerHTML = "<thead><tr><th>Input</th><th>Mean |SHAP| (MW)</th></tr></thead><tbody>"
+        + rows.map((row) => `<tr><td>${row.label || row.feature}</td><td>${fmt(row.mean_abs_shap, 1)}</td></tr>`).join("")
+        + "</tbody>";
+    }
+
+    function sourceTable(id, rows) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (!rows || !rows.length) { el.innerHTML = ""; return; }
+      const names = { demand_lag: "Demand lags", weather: "Weather", calendar: "Calendar", lead: "Lead time", other: "Other" };
+      el.innerHTML = "<thead><tr><th>Source</th><th>Share</th><th>Mean |SHAP|</th></tr></thead><tbody>"
+        + rows.map((row) => `<tr><td>${names[row.source] || row.source}</td><td>${row.share != null ? (100 * row.share).toFixed(0) + "%" : "—"}</td><td>${fmt(row.mean_abs_shap, 1)}</td></tr>`).join("")
+        + "</tbody>";
+    }
+
+    function drawShapPack(id, pack) {
+      const how = document.getElementById("shap-" + id + "-how");
+      const note = document.getElementById("shap-" + id + "-note");
+      if (how) how.textContent = pack.how || "";
+      if (note) note.textContent = pack.note || "";
+      sourceTable("shap-" + id + "-sources", pack.sources || []);
+      shapTable("shap-" + id + "-rank", pack.shap || []);
+    }
+
+    async function loadShap() {
+      const body = await readJson(await fetch("/shap"));
+      document.getElementById("models-note").textContent = body.note || "";
+      const packs = {};
+      (body.packs || []).forEach((pack) => { packs[pack.id] = pack; });
+      drawShapPack("week", packs.week || {});
+      drawShapPack("day", packs.day || {});
+      drawShapPack("hour", packs.hour || {});
+    }
+
+    function showLive() {
+      document.getElementById("live-view").hidden = false;
+      document.getElementById("models-view").hidden = true;
+      document.getElementById("view-live").classList.add("active-view");
+      document.getElementById("view-models").classList.remove("active-view");
+    }
+
+    async function showModels() {
+      document.getElementById("live-view").hidden = true;
+      document.getElementById("models-view").hidden = false;
+      document.getElementById("view-live").classList.remove("active-view");
+      document.getElementById("view-models").classList.add("active-view");
+      const note = document.getElementById("note");
+      note.textContent = "Loading SHAP…";
+      try {
+        await loadShap();
+        note.textContent = "";
+      } catch (err) {
+        note.textContent = String(err);
+      }
+    }
+
+    function drawLab(lab, liveByPack) {
       const packs = lab.packs || [];
       const optuna = lab.optuna || [];
       const tracking = lab.tracking || {};
-      const tuned = packs.filter((row) => row.tuned).length;
+      const live = liveByPack || {};
       document.getElementById("lab-note").textContent = packs.length
-        ? (tuned + " of " + packs.length + " packs have an Optuna winner in production")
+        ? (packs.length + " packs on this box")
         : "No saved packs on this box.";
       const links = [];
       if (tracking.notebook) links.push(`<a href="${tracking.notebook}">Optuna notebook</a>`);
       if (tracking.wandb) links.push(`<a href="${tracking.wandb}">Weights &amp; Biases</a>`);
       else links.push('<span class="muted" title="Set WANDB_PROJECT_URL on the server to show a live W&amp;B project.">W&amp;B — set WANDB_PROJECT_URL</span>');
-      if (tracking.mlflow) links.push(`<a href="${tracking.mlflow}">MLflow</a>`);
-      else links.push('<span class="muted" title="Set MLFLOW_UI_URL on the server to show the tracking UI.">MLflow — set MLFLOW_UI_URL</span>');
       document.getElementById("lab-links").innerHTML = links.join(" · ");
       const packTable = document.getElementById("lab-packs");
-      packTable.innerHTML = "<thead><tr><th>Pack</th><th>Search</th><th>Holdout MAE</th><th>Coverage</th><th>Trees</th><th>Tuned</th></tr></thead><tbody>"
-        + packs.map((row) => `<tr>
+      packTable.innerHTML = "<thead><tr><th>Pack</th><th>Holdout MAE</th><th>This freeze MAE</th><th>Holdout cov</th></tr></thead><tbody>"
+        + packs.map((row) => {
+            const now = live[row.id] || {};
+            return `<tr>
             <td title="${row.note || ""}">${row.label || row.id}</td>
-            <td>${row.search || "—"}</td>
             <td>${row.holdout_mae != null ? fmt(row.holdout_mae) + " MW" : "—"}</td>
+            <td>${now.mae != null ? fmt(now.mae) + " MW" : "—"}</td>
             <td>${row.holdout_coverage != null ? (100 * row.holdout_coverage).toFixed(0) + "%" : "—"}</td>
-            <td>${fmt(row.n_estimators)}</td>
-            <td>${row.tuned ? "Optuna" : "defaults"}</td>
-          </tr>`).join("")
+          </tr>`;
+          }).join("")
         + "</tbody>";
       const studyTable = document.getElementById("lab-optuna");
       studyTable.innerHTML = "<thead><tr><th>Study</th><th>Trials</th><th>Best MAE</th></tr></thead><tbody>"
@@ -805,7 +997,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const names = { week: "week", day: "day", next30: "next 30 minutes" };
       const headers = {};
       if (preset === "week") {
-        const pw = window.prompt("Password to re-issue this week's freeze");
+        const pw = window.prompt("Password to re-issue this week's freeze (WEEK_REISSUE_PASSWORD, or data/live/week_reissue_password)");
         if (pw == null || pw === "") {
           note.textContent = "Week re-issue cancelled";
           return;
@@ -828,6 +1020,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     document.getElementById("capture").onclick = () => runCapture(false);
     document.getElementById("reload").onclick = () => reloadBoard();
+    document.getElementById("view-live").onclick = () => showLive();
+    document.getElementById("view-models").onclick = () => showModels();
     document.querySelectorAll("button[data-preset]").forEach((btn) => {
       btn.onclick = () => reissuePreset(btn.dataset.preset);
     });

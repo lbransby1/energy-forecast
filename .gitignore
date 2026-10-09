@@ -10,6 +10,9 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+.wandb/
+wandb/
+notebooks/wandb/
 .env
 .env.*
 !.env.example

@@ -1,0 +1,94 @@
+{
+  "architecture": "mean_then_quantiles",
+  "quantiles": [
+    0.1,
+    0.5,
+    0.9
+  ],
+  "features": [
+    "settlement_period",
+    "day_of_week",
+    "is_weekend",
+    "is_holiday",
+    "period_sin",
+    "period_cos",
+    "month_sin",
+    "month_cos",
+    "lead_hours",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "shortwave_radiation",
+    "temp_mean_fwd_12h",
+    "temp_mean_fwd_24h",
+    "demand_lag_48",
+    "demand_lag_96",
+    "demand_lag_336",
+    "wind_delta_1d",
+    "wind_delta_7d",
+    "shortwave_delta_1d",
+    "shortwave_delta_7d"
+  ],
+  "residual_features": [
+    "settlement_period",
+    "day_of_week",
+    "is_weekend",
+    "is_holiday",
+    "period_sin",
+    "period_cos",
+    "month_sin",
+    "month_cos",
+    "lead_hours",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "shortwave_radiation",
+    "temp_mean_fwd_12h",
+    "temp_mean_fwd_24h",
+    "demand_lag_48",
+    "demand_lag_96",
+    "demand_lag_336",
+    "wind_delta_1d",
+    "wind_delta_7d",
+    "shortwave_delta_1d",
+    "shortwave_delta_7d",
+    "mean_pred"
+  ],
+  "regions": [
+    "gb"
+  ],
+  "interval_scale": {
+    "gb": 1.9419698119163513
+  },
+  "target_coverage": 0.8,
+  "trained_at": "2026-10-08T20:47:53.160655+00:00",
+  "n_estimators": 450,
+  "n_train": 90522,
+  "role": "next_day",
+  "holdout_start": "2026-08-07 23:30:00+01:00",
+  "n_holdout": 5090,
+  "exclude_years": [
+    2020,
+    2021,
+    2022,
+    2023
+  ],
+  "max_lead_hours": 24.0,
+  "lgb_params": {
+    "learning_rate": 0.027866030221100926,
+    "num_leaves": 95,
+    "min_child_samples": 73,
+    "subsample": 0.6247987300114157,
+    "colsample_bytree": 0.6591380082373911,
+    "feature_fraction": 0.6591380082373911
+  },
+  "pruned_day": true,
+  "optuna_params": {
+    "learning_rate": 0.027866030221100926,
+    "num_leaves": 95,
+    "min_child_samples": 73,
+    "subsample": 0.6247987300114157,
+    "colsample_bytree": 0.6591380082373911,
+    "n_estimators": 450
+  }
+}

@@ -20,7 +20,17 @@ from energy_forecast.data.weather import (
     load_cached_weather,
 )
 from energy_forecast.evaluate import NEXT_DAY_LEAD_HOURS, NEXT_HOUR_LEAD_HOURS, assign_horizon
-from energy_forecast.features import HOUR_FEATURE_COLUMNS, attach_demand_lags, build_features
+from energy_forecast.features import (
+    HOUR_FEATURE_COLUMNS,
+    SETTLEMENT_STEP,
+    apply_demand_path_lags,
+    attach_demand_lags,
+    build_features,
+    lag_walk_step,
+    seed_demand_path,
+    utc_floor_30min,
+    weather_path_from_forecast,
+)
 from energy_forecast.modes import MEDIUM, MODE_SPEC, SHORT, resample_to_mode
 from energy_forecast.model import (
     QuantileModels,
@@ -36,7 +46,8 @@ from energy_forecast.settlement import LONDON_TZ, normalize_settlement_date
 
 # Extra forecast days so the last horizon hour still has a 24h forward window.
 FORWARD_BUFFER_HOURS = 24
-ARCHIVE_LAG_DAYS = 7
+# Week v3 needs 7d weather deltas and 3-week demand lags if the ERA5 archive is short.
+ARCHIVE_LAG_DAYS = 22
 # Hour pack must not issue if Insights INDO is older than this.
 LIVE_INDO_MAX_AGE_MINUTES = 90
 
@@ -189,7 +200,7 @@ def _run_half_hourly(
         scored = featured.copy()
         scored = scored[scored["timestamp"] < scored["timestamp"].min() + horizon]
 
-    predicted = _predict_by_horizon(scored, week_models, hour_models, day_models)
+    predicted = _predict_by_horizon(scored, week_models, hour_models, day_models, history=featured)
     predicted["horizon"] = assign_horizon(predicted["lead_hours"])
     if {"p10", "p90"}.issubset(predicted.columns):
         predicted["interval_width"] = predicted["p90"] - predicted["p10"]
@@ -213,11 +224,143 @@ def run_live_detail(*, horizon_hours: int = 168, model_dir: Path | None = None) 
     else:
         scored = featured.copy()
         scored = scored[scored["timestamp"] < scored["timestamp"].min() + horizon]
-    predicted = _predict_by_horizon(scored, week_models, hour_models, day_models)
+    predicted = _predict_by_horizon(scored, week_models, hour_models, day_models, history=featured)
     predicted["horizon"] = assign_horizon(predicted["lead_hours"])
     if {"p10", "p90"}.issubset(predicted.columns):
         predicted["interval_width"] = predicted["p90"] - predicted["p10"]
     return predicted.sort_values("timestamp").reset_index(drop=True)
+
+
+def predict_quantiles_recursive(
+    frame: pd.DataFrame,
+    models: QuantileModels,
+    *,
+    history: pd.DataFrame | None = None,
+    predict_fn=None,
+    features: list[str] | None = None,
+    step: int | None = None,
+) -> pd.DataFrame:
+    """Walk the horizon in time order. Demand lags roll from observed MW, then P50.
+
+    Weather trajectory is rebuilt from issue-time ``temperature_2m`` (the weather
+    forecast path). ERA5 / ``temperature_actual`` is not used.
+
+    Chunks are a *time* window of ``step`` settlement periods (not a row count),
+    so Previous Runs rows spaced 24h apart still roll ``lag_48`` from yesterday's
+    P50. Frames with several issue origins (lead 0–7 on the same target) walk
+    one lead-day at a time with a demand path per origin.
+    """
+    if frame is None or frame.empty:
+        return frame
+    feature_names = list(features or models.features)
+    walk = int(step) if step is not None else (lag_walk_step(feature_names) or 10**9)
+    work = weather_path_from_forecast(frame, history)
+    if "region_id" not in work.columns:
+        work["region_id"] = SERIES_ID
+    scorer = predict_fn or (lambda rows: predict_quantiles(rows, models))
+    if _has_multiple_origins(work):
+        return _walk_recursive_by_lead(work, scorer, feature_names, history)
+    return _walk_recursive_by_time(work, scorer, feature_names, history, walk)
+
+
+def _has_multiple_origins(frame: pd.DataFrame) -> bool:
+    if frame.empty or "lead_hours" not in frame.columns:
+        return False
+    if frame.duplicated(["region_id", "timestamp"]).any():
+        return True
+    lead = pd.to_numeric(frame["lead_hours"], errors="coerce").fillna(0.0)
+    return bool(lead.max() - lead.min() >= 24.0 and lead.nunique() > 1)
+
+
+def _issue_origin(frame: pd.DataFrame) -> pd.Series:
+    stamps = pd.to_datetime(frame["timestamp"], utc=True)
+    lead = pd.to_numeric(frame["lead_hours"], errors="coerce").fillna(0.0)
+    return stamps - pd.to_timedelta(lead, unit="hours")
+
+
+def _record_p50(path: dict, hat: pd.DataFrame, fallback_region: str) -> None:
+    hat_ts = pd.to_datetime(hat["timestamp"], utc=True)
+    regions = (
+        hat["region_id"].astype(str)
+        if "region_id" in hat.columns
+        else pd.Series([fallback_region] * len(hat), index=hat.index)
+    )
+    p50 = pd.to_numeric(hat["p50"], errors="coerce")
+    for region, stamp, mw in zip(regions, hat_ts, p50):
+        if pd.isna(mw):
+            continue
+        path.setdefault((str(region), utc_floor_30min(stamp)), float(mw))
+
+
+def _walk_recursive_by_time(
+    work: pd.DataFrame,
+    scorer,
+    feature_names: list[str],
+    history: pd.DataFrame | None,
+    walk: int,
+) -> pd.DataFrame:
+    demand_path = seed_demand_path(work, history)
+    walk_td = SETTLEMENT_STEP * max(int(walk), 1)
+    parts: list[pd.DataFrame] = []
+    for _, group in work.groupby("region_id", sort=False):
+        group = group.sort_values("timestamp")
+        stamps = pd.to_datetime(group["timestamp"], utc=True)
+        unique = list(stamps.drop_duplicates().sort_values())
+        index = 0
+        while index < len(unique):
+            start = pd.Timestamp(unique[index])
+            chunk_stamps = [stamp for stamp in unique[index:] if pd.Timestamp(stamp) < start + walk_td]
+            if not chunk_stamps:
+                chunk_stamps = [unique[index]]
+            mask = stamps.isin(chunk_stamps)
+            chunk = apply_demand_path_lags(group.loc[mask].copy(), demand_path, feature_names)
+            hat = scorer(chunk)
+            _record_p50(demand_path, hat, str(group["region_id"].iloc[0]))
+            parts.append(hat)
+            index += len(chunk_stamps)
+    if not parts:
+        return scorer(work)
+    return pd.concat(parts).sort_index()
+
+
+def _walk_recursive_by_lead(
+    work: pd.DataFrame,
+    scorer,
+    feature_names: list[str],
+    history: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """One LightGBM call per lead-day; each Previous Runs origin keeps its own P50 path."""
+    frame = work.copy()
+    frame["_origin"] = _issue_origin(frame)
+    lead = pd.to_numeric(frame["lead_hours"], errors="coerce").fillna(0.0)
+    frame["_lead_day"] = np.round(lead / 24.0).astype(int)
+    seed = seed_demand_path(frame.drop(columns=["_origin", "_lead_day"]), history)
+    paths: dict[pd.Timestamp, dict] = {}
+    parts: list[pd.DataFrame] = []
+    drop = [column for column in ("_origin", "_lead_day") if column in frame.columns]
+    for lead_day in sorted(frame["_lead_day"].unique()):
+        chunk = frame.loc[frame["_lead_day"] == lead_day]
+        lagged: list[pd.DataFrame] = []
+        for origin, group in chunk.groupby("_origin", sort=False):
+            origin_key = pd.Timestamp(pd.to_datetime(origin, utc=True))
+            path = paths.setdefault(origin_key, dict(seed))
+            lagged.append(apply_demand_path_lags(group.drop(columns=drop), path, feature_names))
+        ready = pd.concat(lagged, ignore_index=False)
+        hat = scorer(ready)
+        hat_ts = pd.to_datetime(hat["timestamp"], utc=True)
+        hat_origin = _issue_origin(hat) if "lead_hours" in hat.columns else hat_ts
+        p50 = pd.to_numeric(hat["p50"], errors="coerce")
+        regions = hat["region_id"].astype(str) if "region_id" in hat.columns else pd.Series([SERIES_ID] * len(hat))
+        for region, stamp, origin, mw in zip(regions, hat_ts, hat_origin, p50):
+            if pd.isna(mw):
+                continue
+            origin_key = pd.Timestamp(pd.to_datetime(origin, utc=True))
+            path = paths.setdefault(origin_key, dict(seed))
+            path.setdefault((str(region), utc_floor_30min(stamp)), float(mw))
+        parts.append(hat)
+    if not parts:
+        return scorer(work)
+    return pd.concat(parts).sort_index()
 
 
 def run_pack(
@@ -246,7 +389,12 @@ def run_pack(
     else:
         models = week_models
         fetch_hours = 168
-    featured = prepare_live_frame(horizon_hours=fetch_hours, climatology=week_models.climatology)
+    past_days = 2 if role == "hour" else 8 if role == "day" else ARCHIVE_LAG_DAYS
+    featured = prepare_live_frame(
+        horizon_hours=fetch_hours,
+        past_days=past_days,
+        climatology=week_models.climatology,
+    )
     now = pd.Timestamp.now(tz=LONDON_TZ).floor("30min")
     start = pd.Timestamp(origin) if origin is not None else now
     if start.tzinfo is None:
@@ -273,13 +421,17 @@ def run_pack(
         scored = scored.copy()
         scored["demand_lag_1"] = last_indo_mw
         scored["demand_lag_2"] = prev_indo_mw
+        predicted = predict_quantiles(scored, models)
     else:
         observed = featured.dropna(subset=["demand_mw"]) if "demand_mw" in featured.columns else featured.iloc[0:0]
         last_indo_ts = observed["timestamp"].max() if not observed.empty else pd.NaT
         last_indo_mw = (
             float(observed.loc[observed["timestamp"].idxmax(), "demand_mw"]) if not observed.empty else float("nan")
         )
-    predicted = predict_quantiles(scored, models)
+        if models.metadata.get("long_lags_only"):
+            predicted = predict_quantiles(scored, models)
+        else:
+            predicted = predict_quantiles_recursive(scored, models, history=featured)
     predicted["horizon"] = assign_horizon(predicted["lead_hours"]) if "lead_hours" in predicted.columns else role
     if {"p10", "p90"}.issubset(predicted.columns):
         predicted["interval_width"] = predicted["p90"] - predicted["p10"]
@@ -291,9 +443,7 @@ def run_pack(
         predicted["timestamp"] = pd.to_datetime(predicted["timestamp"], utc=True) + pd.Timedelta(minutes=30)
     keep = [column for column in FORECAST_COLUMNS if column in predicted.columns]
     forecast = predicted.loc[:, keep].sort_values("timestamp").reset_index(drop=True)
-    frozen_wanted = list(_FROZEN_COLUMNS)
-    if role == "hour":
-        frozen_wanted = list(dict.fromkeys([*frozen_wanted, *HOUR_FEATURE_COLUMNS]))
+    frozen_wanted = frozen_feature_columns(role, models)
     frozen_cols = [column for column in frozen_wanted if column in scored.columns]
     frozen = scored.loc[:, frozen_cols].sort_values("timestamp").reset_index(drop=True)
     frozen["last_indo_timestamp"] = last_indo_ts
@@ -344,11 +494,21 @@ _FROZEN_COLUMNS = (
     "demand_lag_1",
     "demand_lag_2",
     "demand_lag_48",
+    "demand_lag_96",
     "demand_lag_336",
     "is_weekend",
     "is_holiday",
     "day_of_week",
 )
+
+
+def frozen_feature_columns(role: str, models: QuantileModels) -> list[str]:
+    """Issue-time columns to persist: base freeze set plus the pack's tree inputs."""
+    wanted = list(_FROZEN_COLUMNS)
+    wanted.extend(models.features)
+    if role == "hour":
+        wanted.extend(HOUR_FEATURE_COLUMNS)
+    return list(dict.fromkeys(wanted))
 
 
 def _limit_horizon(frame: pd.DataFrame, hours: int) -> pd.DataFrame:
@@ -458,13 +618,13 @@ def _try_load_day_models() -> QuantileModels | None:
         return None
 
 
-def _predict_by_horizon(
+def _predict_by_horizon_direct(
     frame: pd.DataFrame,
     week_models: QuantileModels,
     hour_models: QuantileModels | None,
     day_models: QuantileModels | None = None,
 ) -> pd.DataFrame:
-    """Route next hour, next day, and next week to their own models."""
+    """Route a chunk to hour / day / week trees. No lag rolling."""
     if frame.empty or "lead_hours" not in frame.columns:
         return predict_quantiles(frame, week_models)
     lead = pd.to_numeric(frame["lead_hours"], errors="coerce").fillna(0.0)
@@ -487,6 +647,33 @@ def _predict_by_horizon(
     if not parts:
         return predict_quantiles(frame, week_models)
     return pd.concat(parts).sort_index()
+
+
+def _predict_by_horizon(
+    frame: pd.DataFrame,
+    week_models: QuantileModels,
+    hour_models: QuantileModels | None,
+    day_models: QuantileModels | None = None,
+    history: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Route by lead, rolling demand lags from P50 along the weather-forecast path."""
+    if frame.empty:
+        return predict_quantiles(frame, week_models)
+    if week_models.metadata.get("long_lags_only"):
+        return _predict_by_horizon_direct(frame, week_models, hour_models, day_models)
+    feature_names = list(week_models.features)
+    if hour_models is not None:
+        feature_names = list(dict.fromkeys([*feature_names, *hour_models.features]))
+    if day_models is not None:
+        feature_names = list(dict.fromkeys([*feature_names, *day_models.features]))
+    return predict_quantiles_recursive(
+        frame,
+        week_models,
+        history=history,
+        predict_fn=lambda rows: _predict_by_horizon_direct(rows, week_models, hour_models, day_models),
+        features=feature_names,
+        step=1 if hour_models is not None else None,
+    )
 
 
 def _load_archive_weather(demand: pd.DataFrame) -> pd.DataFrame:

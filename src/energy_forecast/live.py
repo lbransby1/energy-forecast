@@ -204,7 +204,10 @@ def _overlay_next30_actuals(rows: pd.DataFrame, context: pd.DataFrame) -> pd.Dat
         .drop_duplicates("timestamp")
         .set_index("timestamp")["actual_mw"]
     )
-    out["actual_mw"] = out["timestamp"].map(lookup)
+    mapped = out["timestamp"].map(lookup)
+    if "actual_mw" in out.columns:
+        mapped = mapped.combine_first(pd.to_numeric(out["actual_mw"], errors="coerce"))
+    out["actual_mw"] = mapped
     return out
 
 
@@ -515,8 +518,10 @@ def _capture_preset(preset: str, *, force: bool = False, week_password: str | No
     if not force and preset != NEXT30 and have_window and not missing_frozen:
         return {"preset": preset, "skipped": True, "window_start": window_start.isoformat()}
     if preset == WEEK and have_window:
-        if not week_password_ok(week_password):
+        if not (week_password or "").strip():
             raise WeekReissueLocked("week freeze is locked; password required to re-issue")
+        if not week_password_ok(week_password):
+            raise WeekReissueLocked("week freeze is locked; password does not match")
 
     origin = None if preset == NEXT30 else window_start
     try:
@@ -1047,6 +1052,24 @@ def _previous_actuals(
     return _frame_records(chunk.loc[:, keep].dropna(subset=["actual_mw"]))
 
 
+def _next30_live_row(scored: pd.DataFrame, now_utc: pd.Timestamp) -> pd.DataFrame:
+    """Latest unanswered 30-minute guess, ignoring ancient holes in the board."""
+    empty = scored.iloc[0:0] if scored is not None else pd.DataFrame()
+    if scored is None or scored.empty:
+        return empty
+    work = scored.copy()
+    work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True)
+    now_utc = _as_utc(now_utc)
+    waiting = work
+    if "actual_mw" in work.columns:
+        waiting = work.loc[pd.to_numeric(work["actual_mw"], errors="coerce").isna()]
+    if waiting.empty:
+        return work.sort_values("timestamp").iloc[-1:]
+    recent = waiting.loc[waiting["timestamp"] >= now_utc - pd.Timedelta(hours=2)]
+    pool = recent if not recent.empty else waiting
+    return pool.sort_values("timestamp").iloc[-1:]
+
+
 def _next30_history(
     next30: pd.DataFrame,
     live30: pd.DataFrame,
@@ -1089,6 +1112,8 @@ def evaluation_payload(
     audit: dict | None = None,
 ) -> dict:
     """Tag scored rows for the validation panel. Local parquet only — no weather API."""
+    empty_pack = {"scored": 0, "outside_band": 0, "lags": 0, "large_miss": 0, "worst": []}
+    by_preset: dict[str, dict] = {preset: {**empty_pack, "worst": []} for preset in PRESETS}
     misses: list[dict] = []
     scored_n = 0
     outside = 0
@@ -1109,6 +1134,10 @@ def evaluation_payload(
         if "issued_at" in work.columns:
             work = work.sort_values("issued_at").drop_duplicates("timestamp", keep="last")
         work = work.reset_index(drop=True)
+        pack_misses: list[dict] = []
+        pack_outside = 0
+        pack_lags = 0
+        pack_large = 0
         scored_n += int(len(work))
         error = pd.to_numeric(work["actual_mw"], errors="coerce") - pd.to_numeric(work["p50"], errors="coerce")
         work["error_mw"] = error
@@ -1127,22 +1156,33 @@ def evaluation_payload(
             if bool(lag_issue.loc[row.name]):
                 tags.append("lags")
                 lags += 1
+                pack_lags += 1
             if bool(band.loc[row.name]):
                 tags.append("outside band")
                 outside += 1
+                pack_outside += 1
             elif float(row["abs_error_mw"]) >= 1500:
                 tags.append("large miss")
                 large += 1
-            misses.append(
-                {
-                    "preset": preset,
-                    "timestamp": _iso_stamp(row["timestamp"]),
-                    "p50": float(row["p50"]),
-                    "actual_mw": float(row["actual_mw"]),
-                    "error_mw": float(row["error_mw"]),
-                    "tag": tags[0] if tags else "typical",
-                }
-            )
+                pack_large += 1
+            item = {
+                "preset": preset,
+                "timestamp": _iso_stamp(row["timestamp"]),
+                "p50": float(row["p50"]),
+                "actual_mw": float(row["actual_mw"]),
+                "error_mw": float(row["error_mw"]),
+                "tag": tags[0] if tags else "typical",
+            }
+            misses.append(item)
+            pack_misses.append(item)
+        pack_misses.sort(key=lambda row: abs(row["error_mw"]), reverse=True)
+        by_preset[preset] = {
+            "scored": int(len(work)),
+            "outside_band": pack_outside,
+            "lags": pack_lags,
+            "large_miss": pack_large,
+            "worst": pack_misses[:8],
+        }
     misses.sort(key=lambda row: abs(row["error_mw"]), reverse=True)
     audit = audit or {}
     return {
@@ -1156,6 +1196,7 @@ def evaluation_payload(
             "note": "Weather-vs-demand needs issued temperature compared with later actual weather. That fills in over a few days; this panel does not call the weather API.",
         },
         "worst": misses[:8],
+        "by_preset": by_preset,
     }
 
 
@@ -1180,12 +1221,7 @@ def board_payload(*, refresh: bool = False) -> dict:
         next30["timestamp"] = pd.to_datetime(next30["timestamp"], utc=True)
         next30 = next30.sort_values("timestamp")
     scored30 = _overlay_next30_actuals(next30, context)
-    live30 = next30.iloc[0:0]
-    if not scored30.empty:
-        waiting = scored30
-        if "actual_mw" in scored30.columns:
-            waiting = scored30.loc[scored30["actual_mw"].isna()].sort_values("timestamp")
-        live30 = waiting.iloc[:1] if not waiting.empty else scored30.iloc[-1:]
+    live30 = _next30_live_row(scored30, now_utc)
     day_windows = _windows(DAY, board)
     week_windows = _windows(WEEK, board)
     history30 = _next30_history(next30, live30, now_utc, context)
